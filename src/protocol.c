@@ -1,6 +1,6 @@
 /*
  *   stunnel       TLS offloading and load-balancing proxy
- *   Copyright (C) 1998-2017 Michal Trojnara <Michal.Trojnara@stunnel.org>
+ *   Copyright (C) 1998-2021 Michal Trojnara <Michal.Trojnara@stunnel.org>
  *
  *   This program is free software; you can redistribute it and/or modify it
  *   under the terms of the GNU General Public License as published by the
@@ -64,6 +64,7 @@ NOEXPORT char *pop3_server(CLI *, SERVICE_OPTIONS *, const PHASE);
 NOEXPORT char *imap_client(CLI *, SERVICE_OPTIONS *, const PHASE);
 NOEXPORT char *imap_server(CLI *, SERVICE_OPTIONS *, const PHASE);
 NOEXPORT char *nntp_client(CLI *, SERVICE_OPTIONS *, const PHASE);
+NOEXPORT char *ldap_client(CLI *, SERVICE_OPTIONS *, const PHASE);
 NOEXPORT char *connect_server(CLI *, SERVICE_OPTIONS *, const PHASE);
 NOEXPORT char *connect_client(CLI *, SERVICE_OPTIONS *, const PHASE);
 #ifndef OPENSSL_NO_MD4
@@ -113,6 +114,10 @@ char *protocol(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
         return opt->option.client ?
             nntp_client(c, opt, phase) :
             "The 'nntp' protocol is not supported in the server mode";
+    if(!strcasecmp(opt->protocol, "ldap"))
+        return opt->option.client ?
+            ldap_client(c, opt, phase) :
+            "The 'ldap' protocol is not supported in the server mode";
     if(!strcasecmp(opt->protocol, "connect"))
         return opt->option.client ?
             connect_client(c, opt, phase) :
@@ -161,12 +166,12 @@ NOEXPORT void socks5_client_method(CLI *c) {
     s_ssl_read(c, &resp, sizeof resp);
     if(resp.ver!=5) {
         s_log(LOG_ERR, "Invalid SOCKS5 message version 0x%02x", resp.ver);
-        longjmp(c->err, 2); /* don't reset */
+        throw_exception(c, 2); /* don't reset */
     }
     /* TODO: add USERNAME/PASSWORD authentication */
     if(resp.method!=0x00) {
         s_log(LOG_ERR, "No supported SOCKS5 authentication method received");
-        longjmp(c->err, 2); /* don't reset */
+        throw_exception(c, 2); /* don't reset */
     }
 }
 
@@ -175,7 +180,7 @@ NOEXPORT void socks5_client_address(CLI *c) {
     SOCKS5_UNION socks;
 
     if(original_dst(c->local_rfd.fd, &addr))
-        longjmp(c->err, 2); /* don't reset */
+        throw_exception(c, 2); /* don't reset */
     memset(&socks, 0, sizeof socks);
     socks.req.ver=5; /* SOCKS5 */
     socks.req.cmd=0x01; /* CONNECT */
@@ -198,7 +203,7 @@ NOEXPORT void socks5_client_address(CLI *c) {
 #endif
     default:
         s_log(LOG_ERR, "Unsupported address type 0x%02x", addr.sa.sa_family);
-        longjmp(c->err, 2); /* don't reset */
+        throw_exception(c, 2); /* don't reset */
     }
 
     s_ssl_read(c, &socks, sizeof socks.resp);
@@ -208,7 +213,7 @@ NOEXPORT void socks5_client_address(CLI *c) {
         s_ssl_read(c, &socks.v4.addr, 4+2);
     if(socks.resp.ver!=5) {
         s_log(LOG_ERR, "Invalid SOCKS5 message version 0x%02x", socks.req.ver);
-        longjmp(c->err, 2); /* don't reset */
+        throw_exception(c, 2); /* don't reset */
     }
     switch(socks.resp.rep) {
         case 0x00:
@@ -251,7 +256,7 @@ NOEXPORT void socks5_client_address(CLI *c) {
             s_log(LOG_ERR,
                 "SOCKS5 request failed: Unknown error 0x%02x", socks.resp.rep);
     }
-    longjmp(c->err, 2); /* don't reset */
+    throw_exception(c, 2); /* don't reset */
 }
 
 NOEXPORT char *socks_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
@@ -274,7 +279,7 @@ NOEXPORT char *socks_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
             break;
         default:
             s_log(LOG_ERR, "Unsupported SOCKS version 0x%02x", version);
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         }
         break;
     case PROTOCOL_LATE:
@@ -359,7 +364,7 @@ NOEXPORT void socks4_server(CLI *c) {
     }
     s_ssl_write(c, &socks, sizeof socks);
     if(close_connection)
-        longjmp(c->err, 2); /* don't reset */
+        throw_exception(c, 2); /* don't reset */
 }
 
 NOEXPORT void socks5_server_method(CLI *c) {
@@ -383,7 +388,7 @@ NOEXPORT void socks5_server_method(CLI *c) {
     s_ssl_write(c, &response, sizeof response);
     if(response.method) { /* request failed */
         s_log(LOG_ERR, "No supported SOCKS5 authentication method received");
-        longjmp(c->err, 2); /* don't reset */
+        throw_exception(c, 2); /* don't reset */
     }
 }
 
@@ -509,7 +514,7 @@ NOEXPORT void socks5_server(CLI *c) {
         s_ssl_write(c, &socks, sizeof socks.v4);
     }
     if(close_connection) /* request failed */
-        longjmp(c->err, 2); /* don't reset */
+        throw_exception(c, 2); /* don't reset */
 }
 
 /* validate the allocated address */
@@ -574,25 +579,25 @@ NOEXPORT char *proxy_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     addrlen=sizeof addr;
     if(getpeername(c->local_rfd.fd, &addr.sa, &addrlen)) {
         sockerror("getpeername");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     err=getnameinfo(&addr.sa, addr_len(&addr), src_host, IP_LEN,
         src_port, PORT_LEN, NI_NUMERICHOST|NI_NUMERICSERV);
     if(err) {
         s_log(LOG_ERR, "getnameinfo: %s", s_gai_strerror(err));
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
 
     addrlen=sizeof addr;
     if(getsockname(c->local_rfd.fd, &addr.sa, &addrlen)) {
         sockerror("getsockname");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     err=getnameinfo(&addr.sa, addr_len(&addr), dst_host, IP_LEN,
         dst_port, PORT_LEN, NI_NUMERICHOST|NI_NUMERICSERV);
     if(err) {
         s_log(LOG_ERR, "getnameinfo: %s", s_gai_strerror(err));
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
 
     switch(addr.sa.sa_family) {
@@ -625,15 +630,15 @@ NOEXPORT char *cifs_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     s_read(c, c->remote_fd.fd, buffer, 5);
     if(buffer[0]!=0x83) { /* NB_SSN_NEGRESP */
         s_log(LOG_ERR, "Negative response expected");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     if(buffer[2]!=0 || buffer[3]!=1) { /* length != 1 */
         s_log(LOG_ERR, "Unexpected NetBIOS response size");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     if(buffer[4]!=0x8e) { /* use TLS */
         s_log(LOG_ERR, "Remote server does not require TLS");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     return NULL;
 }
@@ -651,13 +656,13 @@ NOEXPORT char *cifs_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     len=(uint16_t)(((uint16_t)(buffer[2])<<8)|buffer[3]);
     if(len>sizeof buffer-4) {
         s_log(LOG_ERR, "Received block too long");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     s_read(c, c->local_rfd.fd, buffer+4, len);
     if(buffer[0]!=0x81) { /* NB_SSN_REQUEST */
         s_log(LOG_ERR, "Client did not send session setup");
         s_write(c, c->local_wfd.fd, response_access_denied, 5);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     s_write(c, c->local_wfd.fd, response_use_ssl, 5);
     return NULL;
@@ -679,24 +684,38 @@ NOEXPORT char *pgsql_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     /* S - accepted, N - rejected, non-TLS preferred */
     if(buffer[0]!='S') {
         s_log(LOG_ERR, "PostgreSQL server rejected TLS");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     return NULL;
 }
 
 NOEXPORT char *pgsql_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     uint8_t buffer[8], ssl_ok[1]={'S'};
+    /* https://www.postgresql.org/docs/current/protocol-message-formats.html */
+    static const uint8_t gss_request[8]={0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x30};
+    static const uint8_t gss_response[62]=
+        {'E', 0, 0, 0, 61, 'S', 'E', 'R', 'R', 'O', 'R', 0, 'C', 'X', 'X', '0',
+        '0', '0', 0, 'M', 'S', 'S', 'L', ' ', 'e', 'x', 'p', 'e', 'c', 't', 'e', 'd',
+        ' ', 'b', 'u', 't', ' ', 'n', 'o', 't', ' ', 'r', 'e', 'q', 'u', 'e', 's', 't',
+        'e', 'd', ' ', 'b', 'y', ' ', 'c', 'l', 'i', 'e', 'n', 't', 0, 0};
 
     (void)opt; /* squash the unused parameter warning */
     if(phase!=PROTOCOL_EARLY)
         return NULL;
+    s_log(LOG_DEBUG, "Started server-side psql protocol negotiation");
     memset(buffer, 0, sizeof buffer);
     s_read(c, c->local_rfd.fd, buffer, sizeof buffer);
+    if(!safe_memcmp(buffer, gss_request, sizeof gss_request)) {
+        s_log(LOG_INFO, "GSSAPI encryption requested, rejecting gracefully");
+        s_write(c, c->local_wfd.fd, gss_response, sizeof gss_response);
+        throw_exception(c, 2); /* don't reset */
+    }
     if(safe_memcmp(buffer, ssl_request, sizeof ssl_request)) {
         s_log(LOG_ERR, "PostgreSQL client did not request TLS, rejecting");
         /* no way to send error on startup, so just drop the client */
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
+    s_log(LOG_DEBUG, "SSLRequest received");
     s_write(c, c->local_wfd.fd, ssl_ok, sizeof ssl_ok);
     return NULL;
 }
@@ -711,6 +730,14 @@ NOEXPORT char *smtp_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
         break;
     case PROTOCOL_LATE:
         if(opt->protocol_username && opt->protocol_password) {
+            char *line;
+
+            if(opt->protocol_host)
+                ssl_printf(c, "HELO %s", opt->protocol_host);
+            else
+                ssl_putline(c, "HELO localhost");
+            line=ssl_getline(c); /* ignore the reply */
+            str_free(line);
             if(!strcasecmp(c->opt->protocol_authentication, "LOGIN"))
                 smtp_client_login(c,
                     opt->protocol_username, opt->protocol_password);
@@ -735,7 +762,10 @@ NOEXPORT void smtp_client_negotiate(CLI *c) {
         fd_putline(c, c->local_wfd.fd, line);
     } while(is_prefix(line, "220-"));
 
-    fd_putline(c, c->remote_fd.fd, "EHLO localhost");
+    if(c->opt->protocol_host)
+        fd_printf(c, c->remote_fd.fd, "EHLO %s", c->opt->protocol_host);
+    else
+        fd_putline(c, c->remote_fd.fd, "EHLO localhost");
     do { /* skip multiline reply */
         str_free(line);
         line=fd_getline(c, c->remote_fd.fd);
@@ -743,7 +773,7 @@ NOEXPORT void smtp_client_negotiate(CLI *c) {
     if(!is_prefix(line, "250 ")) { /* error */
         s_log(LOG_ERR, "Remote server is not RFC 1425 compliant");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
 
     fd_putline(c, c->remote_fd.fd, "STARTTLS");
@@ -754,7 +784,7 @@ NOEXPORT void smtp_client_negotiate(CLI *c) {
     if(!is_prefix(line, "220 ")) { /* error */
         s_log(LOG_ERR, "Remote server is not RFC 2487 compliant");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     str_free(line);
 }
@@ -769,7 +799,7 @@ NOEXPORT void smtp_client_plain(CLI *c, const char *user, const char *pass) {
     if(!encoded) {
         s_log(LOG_ERR, "Base64 encoder failed");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     str_free(line);
     line=str_printf("AUTH PLAIN %s", encoded);
@@ -781,7 +811,7 @@ NOEXPORT void smtp_client_plain(CLI *c, const char *user, const char *pass) {
     if(!is_prefix(line, "235 ")) { /* not 'Authentication successful' */
         s_log(LOG_ERR, "PLAIN Authentication Failed");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     str_free(line);
 }
@@ -794,14 +824,14 @@ NOEXPORT void smtp_client_login(CLI *c, const char *user, const char *pass) {
     if(!is_prefix(line, "334 ")) { /* not the username challenge */
         s_log(LOG_ERR, "Remote server does not support LOGIN authentication");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     str_free(line);
 
     encoded=base64(1, user, (int)strlen(user));
     if(!encoded) {
         s_log(LOG_ERR, "Base64 encoder failed");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     ssl_putline(c, encoded);
     str_free(encoded);
@@ -809,14 +839,14 @@ NOEXPORT void smtp_client_login(CLI *c, const char *user, const char *pass) {
     if(!is_prefix(line, "334 ")) { /* not the password challenge */
         s_log(LOG_ERR, "LOGIN authentication failed");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     str_free(line);
 
     encoded=base64(1, pass, (int)strlen(pass));
     if(!encoded) {
         s_log(LOG_ERR, "Base64 encoder failed");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     ssl_putline(c, encoded);
     str_free(encoded);
@@ -824,7 +854,7 @@ NOEXPORT void smtp_client_login(CLI *c, const char *user, const char *pass) {
     if(!is_prefix(line, "235 ")) { /* not 'Authentication successful' */
         s_log(LOG_ERR, "LOGIN authentication failed");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     str_free(line);
 }
@@ -838,7 +868,7 @@ NOEXPORT char *smtp_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
         return NULL;
 
     /* detect RFC 2487 */
-    s_poll_init(c->fds);
+    s_poll_init(c->fds, 0);
     s_poll_add(c->fds, c->local_rfd.fd, 1, 0);
     switch(s_poll_wait(c->fds, 0, 200)) { /* wait up to 200ms */
     case 0: /* fd not ready to read */
@@ -849,7 +879,7 @@ NOEXPORT char *smtp_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
         return NULL; /* return if RFC 2487 is not used */
     default: /* -1 */
         sockerror("RFC2487 (s_poll_wait)");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
 
     /* process server's greeting */
@@ -857,7 +887,7 @@ NOEXPORT char *smtp_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     if(!(is_prefix(line, "220 ") || is_prefix(line, "220-"))) {
         s_log(LOG_ERR, "Unknown server welcome");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     domain=str_dup(line+4); /* skip "220" and the separator */
     line[4]='\0';     /* only leave "220" and the separator */
@@ -882,7 +912,7 @@ NOEXPORT char *smtp_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
         s_log(LOG_ERR, "Unknown client EHLO");
         str_free(line);
         str_free(domain);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     str_free(line);
     fd_printf(c, c->local_wfd.fd, "250-%s", domain);
@@ -894,7 +924,7 @@ NOEXPORT char *smtp_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     if(!is_prefix(line, "STARTTLS")) {
         s_log(LOG_ERR, "STARTTLS expected");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     fd_putline(c, c->local_wfd.fd, "220 Go ahead");
     str_free(line);
@@ -914,7 +944,7 @@ NOEXPORT char *pop3_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     if(!is_prefix(line, "+OK ")) {
         s_log(LOG_ERR, "Unknown server welcome");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     fd_putline(c, c->local_wfd.fd, line);
     fd_putline(c, c->remote_fd.fd, "STLS");
@@ -923,7 +953,7 @@ NOEXPORT char *pop3_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     if(!is_prefix(line, "+OK ")) {
         s_log(LOG_ERR, "Server does not support TLS");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     str_free(line);
     return NULL;
@@ -950,7 +980,7 @@ NOEXPORT char *pop3_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     if(!is_prefix(line, "STLS")) {
         s_log(LOG_ERR, "Client does not want TLS");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     str_free(line);
     fd_putline(c, c->local_wfd.fd, "+OK Stunnel starts TLS negotiation");
@@ -969,18 +999,18 @@ NOEXPORT char *imap_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     if(!is_prefix(line, "* OK")) {
         s_log(LOG_ERR, "Unknown server welcome");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
-    fd_putline(c, c->local_wfd.fd, line);
-    fd_putline(c, c->remote_fd.fd, "stunnel STARTTLS");
     str_free(line);
+    fd_putline(c, c->local_wfd.fd, "* OK Connected.");
+    fd_putline(c, c->remote_fd.fd, "stunnel STARTTLS");
     line=fd_getline(c, c->remote_fd.fd);
     if(!is_prefix(line, "stunnel OK")) {
         fd_putline(c, c->local_wfd.fd,
             "* BYE stunnel: Server does not support TLS");
         s_log(LOG_ERR, "Server does not support TLS");
         str_free(line);
-        longjmp(c->err, 2); /* don't reset */
+        throw_exception(c, 2); /* don't reset */
     }
     str_free(line);
     return NULL;
@@ -993,7 +1023,7 @@ NOEXPORT char *imap_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
         opt->option.connect_before_ssl=1; /* c->remote_fd needed */
     if(phase!=PROTOCOL_MIDDLE)
         return NULL;
-    s_poll_init(c->fds);
+    s_poll_init(c->fds, 0);
     s_poll_add(c->fds, c->local_rfd.fd, 1, 0);
     switch(s_poll_wait(c->fds, 0, 200)) {
     case 0: /* fd not ready to read */
@@ -1004,7 +1034,7 @@ NOEXPORT char *imap_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
         return NULL; /* return if RFC 2595 is not used */
     default: /* -1 */
         sockerror("RFC2595 (s_poll_wait)");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
 
     /* process server welcome and send it to client */
@@ -1012,7 +1042,7 @@ NOEXPORT char *imap_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     if(!is_prefix(line, "* OK")) {
         s_log(LOG_ERR, "Unknown server welcome");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     capa=strstr(line, "CAPABILITY");
     if(!capa)
@@ -1083,7 +1113,7 @@ NOEXPORT char *imap_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
         line=fd_getline(c, c->remote_fd.fd);
     }
     str_free(line);
-    longjmp(c->err, 2); /* don't reset */
+    throw_exception(c, 2); /* don't reset */
     return NULL; /* some C compilers require a return value */
 }
 
@@ -1099,7 +1129,7 @@ NOEXPORT char *nntp_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     if(!is_prefix(line, "200 ") && !is_prefix(line, "201 ")) {
         s_log(LOG_ERR, "Unknown server welcome");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     fd_putline(c, c->local_wfd.fd, line);
     fd_putline(c, c->remote_fd.fd, "STARTTLS");
@@ -1108,9 +1138,135 @@ NOEXPORT char *nntp_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     if(!is_prefix(line, "382 ")) {
         s_log(LOG_ERR, "Server does not support TLS");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     str_free(line);
+    return NULL;
+}
+
+/**************************************** LDAP, RFC 2830 */
+
+uint8_t ldap_starttls_message[0x1d + 2] = {
+    0x30,   /* tag = UNIVERSAL SEQUENCE */
+    0x1d,   /* len = 29 */
+    0x02,   /*   tag = INTEGER (messageID) */
+    0x01,   /*   len = 1 */
+    0x01,   /*   val = 1 (this is messageID 1) */
+    0x77,   /*   tag = APPLICATION 23 (ExtendedRequest)
+             *     0b01xxxxxx =>  Class = Application
+             *     0bxx1xxxxx =>    P/C = Constructed
+             *     0bxxx10111 => Number = 23 */
+    0x18,   /*   len = 24 */
+    0x80,   /*     tag = CONTEXT-SPECIFIC 0 (requestName) */
+    0x16,   /*     len = 22 */
+            /*     val = LDAP_START_TLS_OID
+             *       OID: 1.3.6.1.4.1.1466.20037 */
+    '1', '.',
+    '3', '.',
+    '6', '.',
+    '1', '.',
+    '4', '.',
+    '1', '.',
+    '1', '4', '6', '6', '.',
+    '2', '0', '0', '3', '7'
+    /* no requestValue, as per RFC2830
+     * (section 2.1: "The requestValue field is absent") */
+};
+
+#define LDAP_UNIVERSAL_SEQUENCE                 0x30
+#define LDAP_WINLDAP_FOUR_BYTE_LEN_FLAG         0x84
+#define LDAP_RESPONSE_MSG_ID_TAG_INTEGER        0x02
+#define LDAP_RESPONSE_MSG_ID_LEN                0x01
+#define LDAP_RESPONSE_MSG_ID_VAL                0x01
+#define LDAP_RESPONSE_OP_APPLICATION_24         0x78
+#define LDAP_RESPONSE_RESULT_TAG_ENUMERATED     0x0a
+#define LDAP_RESPONSE_RESULT_LEN                0x01
+#define LDAP_RESPONSE_RESULT_VAL_SUCCESS        0x00
+
+/* also see:
+ * https://ldap.com/ldapv3-wire-protocol-reference-extended/
+ */
+
+NOEXPORT char *ldap_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
+    uint8_t buffer_8;
+    uint32_t buffer_32;
+    size_t resp_len;
+    uint8_t ldap_response[128];
+    size_t resp_idx;
+
+    (void)opt; /* squash the unused parameter warning */
+
+    if(phase!=PROTOCOL_MIDDLE)
+        return NULL;
+
+    s_log(LOG_DEBUG, "Sending LDAP Start TLS request");
+    s_write(c, c->remote_fd.fd, ldap_starttls_message, sizeof(ldap_starttls_message));
+
+    s_log(LOG_DEBUG, "Receiving LDAP response tag");
+    s_read(c, c->remote_fd.fd, &buffer_8, 1);
+    if(buffer_8!=LDAP_UNIVERSAL_SEQUENCE) {
+        s_log(LOG_ERR, "LDAP response is not UNIVERSAL SEQUENCE");
+        throw_exception(c, 1);
+    }
+
+    s_log(LOG_DEBUG, "Receiving LDAP response length");
+    s_read(c, c->remote_fd.fd, &buffer_8, 1);
+    if(buffer_8==LDAP_WINLDAP_FOUR_BYTE_LEN_FLAG) { /* WinLDAP */
+        /* receive response length (4 bytes, network byte order) */
+        s_read(c, c->remote_fd.fd, &buffer_32, 4);
+        resp_len=ntohl(buffer_32);
+    } else {
+        resp_len=buffer_8;
+    }
+    if(resp_len>sizeof(ldap_response)) {
+        s_log(LOG_ERR, "LDAP response too long (%lu byte(s))",
+            (unsigned long)resp_len);
+        throw_exception(c, 1);
+    }
+
+    s_log(LOG_DEBUG, "Receiving LDAP response value (%lu byte(s))",
+        (unsigned long)resp_len);
+    memset(ldap_response, 0, sizeof(ldap_response)); /* prevent data leaks */
+    s_read(c, c->remote_fd.fd, ldap_response, resp_len);
+
+    s_log(LOG_DEBUG, "Decoding LDAP response value");
+    resp_idx=0;
+    if(ldap_response[resp_idx++]!=LDAP_RESPONSE_MSG_ID_TAG_INTEGER) {
+        s_log(LOG_ERR, "LDAP response has an incorrect message ID type");
+        throw_exception(c, 1);
+    }
+    if(ldap_response[resp_idx++]!=LDAP_RESPONSE_MSG_ID_LEN) {
+        s_log(LOG_ERR, "LDAP response has an unexpected message ID length");
+        throw_exception(c, 1);
+    }
+    if(ldap_response[resp_idx++]!=LDAP_RESPONSE_MSG_ID_VAL) {
+        s_log(LOG_ERR, "LDAP response has an unexpected message ID value");
+        throw_exception(c, 1);
+    }
+    if(ldap_response[resp_idx++]!=LDAP_RESPONSE_OP_APPLICATION_24) {
+        s_log(LOG_ERR, "LDAP response protocol op is not ExtendedResponse");
+        throw_exception(c, 1);
+    }
+    /* we do not validate the protocol op sequence length */
+    if(ldap_response[resp_idx++]==LDAP_WINLDAP_FOUR_BYTE_LEN_FLAG) { /* WinLDAP */
+        resp_idx+=4; /* skip next 4 bytes */
+    }
+    if(ldap_response[resp_idx++]!=LDAP_RESPONSE_RESULT_TAG_ENUMERATED) {
+        s_log(LOG_ERR, "LDAP response has an unexpected result code type");
+        throw_exception(c, 1);
+    }
+    if(ldap_response[resp_idx++]!=LDAP_RESPONSE_RESULT_LEN) {
+        s_log(LOG_ERR, "LDAP response has an unexpected result code length");
+        throw_exception(c, 1);
+    }
+    if(ldap_response[resp_idx]!=LDAP_RESPONSE_RESULT_VAL_SUCCESS) {
+        s_log(LOG_ERR, "LDAP response has indicated an error (%u)",
+            ldap_response[resp_idx]);
+        throw_exception(c, 1);
+    }
+    /* any remaining data is ignored */
+
+    s_log(LOG_INFO, "LDAP Start TLS successfully negotiated");
     return NULL;
 }
 
@@ -1128,7 +1284,7 @@ NOEXPORT char *connect_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
         fd_putline(c, c->local_wfd.fd, "Server: stunnel/" STUNNEL_VERSION);
         fd_putline(c, c->local_wfd.fd, "");
         str_free(request);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     proto=strchr(request+8, ' ');
     if(!proto || !is_prefix(proto, " HTTP/")) {
@@ -1136,7 +1292,7 @@ NOEXPORT char *connect_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
         fd_putline(c, c->local_wfd.fd, "Server: stunnel/" STUNNEL_VERSION);
         fd_putline(c, c->local_wfd.fd, "");
         str_free(request);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     *proto='\0';
 
@@ -1152,7 +1308,7 @@ NOEXPORT char *connect_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
         fd_putline(c, c->local_wfd.fd, "Server: stunnel/" STUNNEL_VERSION);
         fd_putline(c, c->local_wfd.fd, "");
         str_free(request);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     str_free(request);
     fd_putline(c, c->local_wfd.fd, "HTTP/1.0 200 OK");
@@ -1163,12 +1319,14 @@ NOEXPORT char *connect_server(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
 
 NOEXPORT char *connect_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
     char *line, *encoded;
+    NAME_LIST *ptr;
 
     if(phase!=PROTOCOL_MIDDLE)
         return NULL;
+
     if(!opt->protocol_host) {
         s_log(LOG_ERR, "protocolHost not specified");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     fd_printf(c, c->remote_fd.fd, "CONNECT %s HTTP/1.1",
         opt->protocol_host);
@@ -1179,7 +1337,7 @@ NOEXPORT char *connect_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
             ntlm(c, opt);
 #else
             s_log(LOG_ERR, "NTLM authentication is not available");
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
 #endif
         } else { /* basic authentication */
             line=str_printf("%s:%s",
@@ -1188,14 +1346,17 @@ NOEXPORT char *connect_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
             str_free(line);
             if(!encoded) {
                 s_log(LOG_ERR, "Base64 encoder failed");
-                longjmp(c->err, 1);
+                throw_exception(c, 1);
             }
             fd_printf(c, c->remote_fd.fd, "Proxy-Authorization: basic %s",
                 encoded);
             str_free(encoded);
         }
     }
+    for(ptr=opt->protocol_header; ptr; ptr=ptr->next)
+        fd_putline(c, c->remote_fd.fd, ptr->name); /* custom header */
     fd_putline(c, c->remote_fd.fd, ""); /* empty line */
+
     line=fd_getline(c, c->remote_fd.fd);
     if(!is_prefix(line, "HTTP/1.0 2") && !is_prefix(line, "HTTP/1.1 2")) {
         /* not "HTTP/1.x 2xx Connection established" */
@@ -1205,7 +1366,7 @@ NOEXPORT char *connect_client(CLI *c, SERVICE_OPTIONS *opt, const PHASE phase) {
             line=fd_getline(c, c->remote_fd.fd);
         } while(*line);
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     s_log(LOG_INFO, "CONNECT request accepted");
     do {
@@ -1235,7 +1396,7 @@ NOEXPORT void ntlm(CLI *c, SERVICE_OPTIONS *opt) {
     ntlm1_txt=ntlm1();
     if(!ntlm1_txt) {
         s_log(LOG_ERR, "Proxy-Authenticate: Failed to build NTLM request");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     fd_printf(c, c->remote_fd.fd, "Proxy-Authorization: NTLM %s", ntlm1_txt);
     str_free(ntlm1_txt);
@@ -1250,7 +1411,7 @@ NOEXPORT void ntlm(CLI *c, SERVICE_OPTIONS *opt) {
             line=fd_getline(c, c->remote_fd.fd);
         } while(*line);
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     ntlm2_txt=NULL;
     do { /* read all headers */
@@ -1266,14 +1427,14 @@ NOEXPORT void ntlm(CLI *c, SERVICE_OPTIONS *opt) {
             if(tmpstr==line+16 || *tmpstr || content_length<0) {
                 s_log(LOG_ERR, "Proxy-Authenticate: Invalid Content-Length");
                 str_free(line);
-                longjmp(c->err, 1);
+                throw_exception(c, 1);
             }
         }
     } while(*line);
     if(!ntlm2_txt) { /* no Proxy-Authenticate: NTLM header */
         s_log(LOG_ERR, "Proxy-Authenticate: NTLM header not found");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
 
     /* read and ignore HTTP content (if any) */
@@ -1291,7 +1452,7 @@ NOEXPORT void ntlm(CLI *c, SERVICE_OPTIONS *opt) {
     str_free(ntlm2_txt);
     if(!ntlm3_txt) {
         s_log(LOG_ERR, "Proxy-Authenticate: Failed to build NTLM response");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     fd_printf(c, c->remote_fd.fd, "Proxy-Authorization: NTLM %s", ntlm3_txt);
     str_free(ntlm3_txt);
@@ -1372,8 +1533,8 @@ NOEXPORT char *ntlm3(char *domain,
     crypt_DES(phase3+ntlm_off+16, decoded+24, md4_hash+14);
     str_free(decoded);
 
-    strncpy((char *)phase3+domain_off, domain, domain_len);
-    strncpy((char *)phase3+user_off, user, user_len);
+    memcpy((char *)phase3+domain_off, domain, domain_len);
+    memcpy((char *)phase3+user_off, user, user_len);
 
     return base64(1, (char *)phase3, (int)end_off); /* encode */
 }
@@ -1413,7 +1574,7 @@ NOEXPORT char *base64(int encode, const char *in, int len) {
     BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
     bio=BIO_new(BIO_s_mem());
     if(!bio) {
-        str_free(b64);
+        BIO_free(b64);
         return NULL;
     }
     if(encode)

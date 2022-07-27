@@ -1,6 +1,6 @@
 /*
  *   stunnel       TLS offloading and load-balancing proxy
- *   Copyright (C) 1998-2017 Michal Trojnara <Michal.Trojnara@stunnel.org>
+ *   Copyright (C) 1998-2021 Michal Trojnara <Michal.Trojnara@stunnel.org>
  *
  *   This program is free software; you can redistribute it and/or modify it
  *   under the terms of the GNU General Public License as published by the
@@ -99,6 +99,7 @@ NOEXPORT int main_unix(int argc, char* argv[]) {
         signal(SIGCHLD, signal_handler); /* handle dead children */
         signal(SIGHUP, signal_handler); /* configuration reload */
         signal(SIGUSR1, signal_handler); /* log reopen */
+        signal(SIGUSR2, signal_handler); /* connections */
         signal(SIGPIPE, SIG_IGN); /* ignore broken pipe */
         if(signal(SIGTERM, SIG_IGN)!=SIG_IGN)
             signal(SIGTERM, signal_handler); /* fatal */
@@ -107,7 +108,22 @@ NOEXPORT int main_unix(int argc, char* argv[]) {
         if(signal(SIGINT, SIG_IGN)!=SIG_IGN)
             signal(SIGINT, signal_handler); /* fatal */
 #endif
+#ifdef USE_FORK
+        setpgid(0, 0); /* create a new process group if needed */
+#endif
         daemon_loop();
+#ifdef USE_FORK
+        s_log(LOG_NOTICE, "Terminating service processes");
+        signal(SIGCHLD, SIG_IGN);
+        signal(SIGTERM, SIG_IGN);
+        kill(0, SIGTERM); /* kill the whole process group */
+        while(wait(NULL)!=-1)
+            ;
+        s_log(LOG_NOTICE, "Service processes terminated");
+#endif
+#if !defined(__vms) && !defined(USE_OS2)
+        delete_pid();
+#endif /* standard Unix */
     } else { /* inetd mode */
         CLI *c;
 #if !defined(__vms) && !defined(USE_OS2)
@@ -121,7 +137,9 @@ NOEXPORT int main_unix(int argc, char* argv[]) {
         set_nonblock(1, 1); /* stdout */
         c=alloc_client_session(&service_options, 0, 1);
         tls_alloc(c, ui_tls, NULL);
+        service_up_ref(&service_options);
         client_main(c);
+        client_free(c);
     }
     return 0;
 }
@@ -131,7 +149,7 @@ NOEXPORT void signal_handler(int sig) {
     int saved_errno;
 
     saved_errno=errno;
-    signal_post(sig);
+    signal_post((uint8_t)sig);
     signal(sig, signal_handler);
     errno=saved_errno;
 }
@@ -179,22 +197,18 @@ NOEXPORT int create_pid(void) {
         s_log(LOG_DEBUG, "No pid file being created");
         return 0;
     }
-    if(global_options.pidfile[0]!='/') {
-        /* to prevent creating pid file relative to '/' after daemonize() */
-        s_log(LOG_ERR, "Pid file (%s) must be full path name", global_options.pidfile);
-        return 1;
-    }
-    global_options.dpid=(unsigned long)getpid();
 
-    /* silently remove old pid file */
+    /* silently remove the old pid file */
     unlink(global_options.pidfile);
+
+    /* create a new pid file */
     pf=open(global_options.pidfile, O_WRONLY|O_CREAT|O_TRUNC|O_EXCL, 0644);
     if(pf==-1) {
         s_log(LOG_ERR, "Cannot create pid file %s", global_options.pidfile);
         ioerror("create");
         return 1;
     }
-    pid=str_printf("%lu\n", global_options.dpid);
+    pid=str_printf("%lu\n", (unsigned long)getpid());
     if(write(pf, pid, strlen(pid))<(int)strlen(pid)) {
         s_log(LOG_ERR, "Cannot write pid file %s", global_options.pidfile);
         ioerror("write");
@@ -203,16 +217,18 @@ NOEXPORT int create_pid(void) {
     str_free(pid);
     close(pf);
     s_log(LOG_DEBUG, "Created pid file %s", global_options.pidfile);
-    atexit(delete_pid);
     return 0;
 }
 
 NOEXPORT void delete_pid(void) {
-    if((unsigned long)getpid()!=global_options.dpid)
-        return; /* current process is not main daemon process */
-    s_log(LOG_DEBUG, "removing pid file %s", global_options.pidfile);
-    if(unlink(global_options.pidfile)<0)
-        ioerror(global_options.pidfile); /* not critical */
+    if(global_options.pidfile) {
+        if(unlink(global_options.pidfile)<0)
+            ioerror(global_options.pidfile); /* not critical */
+        else
+            s_log(LOG_DEBUG, "Removed pid file %s", global_options.pidfile);
+    } else {
+        s_log(LOG_DEBUG, "No pid file to remove");
+    }
 }
 
 #endif /* standard Unix */
@@ -260,9 +276,23 @@ int ui_passwd_cb(char *buf, int size, int rwflag, void *userdata) {
 }
 
 #ifndef OPENSSL_NO_ENGINE
-UI_METHOD *UI_stunnel() {
-    return UI_OpenSSL();
+
+int (*ui_get_opener()) (UI *) {
+    return UI_method_get_opener(UI_OpenSSL());
 }
+
+int (*ui_get_writer()) (UI *, UI_STRING *) {
+    return UI_method_get_writer(UI_OpenSSL());
+}
+
+int (*ui_get_reader()) (UI *, UI_STRING *) {
+    return UI_method_get_reader(UI_OpenSSL());
+}
+
+int (*ui_get_closer()) (UI *) {
+    return UI_method_get_closer(UI_OpenSSL());
+}
+
 #endif
 
 /* end of ui_unix.c */

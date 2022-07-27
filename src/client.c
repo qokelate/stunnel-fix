@@ -1,6 +1,6 @@
 /*
  *   stunnel       TLS offloading and load-balancing proxy
- *   Copyright (C) 1998-2017 Michal Trojnara <Michal.Trojnara@stunnel.org>
+ *   Copyright (C) 1998-2021 Michal Trojnara <Michal.Trojnara@stunnel.org>
  *
  *   This program is free software; you can redistribute it and/or modify it
  *   under the terms of the GNU General Public License as published by the
@@ -49,18 +49,21 @@
 #endif
 
 NOEXPORT void client_try(CLI *);
+NOEXPORT void exec_connect_loop(CLI *);
+NOEXPORT void exec_connect_once(CLI *);
 NOEXPORT void client_run(CLI *);
 NOEXPORT void local_start(CLI *);
 NOEXPORT void remote_start(CLI *);
 NOEXPORT void ssl_start(CLI *);
-NOEXPORT void session_cache_save(CLI *);
 NOEXPORT void session_cache_retrieve(CLI *);
-NOEXPORT void new_chain(CLI *);
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+NOEXPORT void print_tmp_key(SSL *s);
+#endif
+NOEXPORT void print_cipher(CLI *);
 NOEXPORT void transfer(CLI *);
 NOEXPORT int parse_socket_error(CLI *, const char *);
 
-NOEXPORT void print_cipher(CLI *);
-NOEXPORT void auth_user(CLI *, char *);
+NOEXPORT void auth_user(CLI *);
 NOEXPORT SOCKET connect_local(CLI *);
 #if !defined(USE_WIN32) && !defined(__vms)
 NOEXPORT char **env_alloc(CLI *);
@@ -70,7 +73,8 @@ NOEXPORT SOCKET connect_remote(CLI *);
 NOEXPORT void idx_cache_save(SSL_SESSION *, SOCKADDR_UNION *);
 NOEXPORT unsigned idx_cache_retrieve(CLI *);
 NOEXPORT void connect_setup(CLI *);
-NOEXPORT int connect_init(CLI *c, int);
+NOEXPORT int connect_init(CLI *, int);
+NOEXPORT int redirect(CLI *);
 NOEXPORT void print_bound_address(CLI *);
 NOEXPORT void reset(SOCKET, char *);
 
@@ -84,77 +88,192 @@ CLI *alloc_client_session(SERVICE_OPTIONS *opt, SOCKET rfd, SOCKET wfd) {
     c->local_rfd.fd=rfd;
     c->local_wfd.fd=wfd;
     c->seq=seq++;
+    c->rr=c->opt->rr++;
     return c;
 }
 
-void *client_thread(void *arg) {
+#if defined(USE_WIN32) || defined(USE_OS2)
+unsigned __stdcall
+#else
+void *
+#endif
+        client_thread(void *arg) {
     CLI *c=arg;
+#ifdef DEBUG_STACK_SIZE
+    size_t stack_size=c->opt->stack_size;
+#endif
 
+#ifdef USE_FORK
+    /* do not use signal pipe in child processes */
+    signal(SIGCHLD, SIG_IGN); /* ignore dead children */
+    signal(SIGHUP, SIG_DFL);
+    signal(SIGUSR1, SIG_DFL);
+    signal(SIGUSR2, SIG_DFL);
+    signal(SIGPIPE, SIG_IGN); /* ignore broken pipe */
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGQUIT, SIG_DFL);
+    signal(SIGINT, SIG_DFL);
+#endif /* USE_FORK */
+
+    /* make sure c->thread_* values are initialized */
+    CRYPTO_THREAD_read_lock(stunnel_locks[LOCK_THREAD_LIST]);
+    CRYPTO_THREAD_unlock(stunnel_locks[LOCK_THREAD_LIST]);
+
+    /* initialize */
     c->tls=NULL; /* do not reuse */
     tls_alloc(c, NULL, NULL);
 #ifdef DEBUG_STACK_SIZE
-    stack_info(1); /* initialize */
+    stack_info(stack_size, 1); /* initialize */
 #endif
+
+    /* execute */
     client_main(c);
+
+    /* cleanup the thread */
+#ifndef USE_FORK
+    CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_THREAD_LIST]);
+    if(thread_head==c)
+        thread_head=c->thread_next;
+    if(c->thread_prev)
+        c->thread_prev->thread_next=c->thread_next;
+    if(c->thread_next)
+        c->thread_next->thread_prev=c->thread_prev;
+#ifdef USE_PTHREAD
+    pthread_detach(c->thread_id);
+#endif
+#ifdef USE_WIN32
+    CloseHandle(c->thread_id);
+#endif
+    CRYPTO_THREAD_unlock(stunnel_locks[LOCK_THREAD_LIST]);
+#endif /* !USE_FORK */
+    client_free(c);
 #ifdef DEBUG_STACK_SIZE
-    stack_info(0); /* display computed value */
+    stack_info(stack_size, 0); /* display computed value */
 #endif
     str_stats(); /* client thread allocation tracking */
     tls_cleanup();
     /* s_log() is not allowed after tls_cleanup() */
-#if defined(USE_WIN32) && !defined(_WIN32_WCE)
-    _endthread();
+
+    /* terminate the thread */
+#if defined(USE_WIN32) || defined(USE_OS2)
+#if !defined(_WIN32_WCE)
+    _endthreadex(0);
 #endif
+    return 0;
+#else
 #ifdef USE_UCONTEXT
     s_poll_wait(NULL, 0, 0); /* wait on poll() */
 #endif
     return NULL;
+#endif
 }
+
+#ifdef DEBUG_STACK_SIZE
+void ignore_value(void *ptr) {
+    (void)ptr; /* squash the unused parameter warning */
+}
+#endif
 
 void client_main(CLI *c) {
     s_log(LOG_DEBUG, "Service [%s] started", c->opt->servname);
     if(c->opt->exec_name && c->opt->connect_addr.names) {
-            /* exec+connect options specified together
-             * -> spawn a local program instead of stdio */
-        for(;;) {
-            SERVICE_OPTIONS *opt=c->opt;
-            memset(c, 0, sizeof(CLI)); /* connect_local needs clean c */
-            c->opt=opt;
-            if(!setjmp(c->err))
-                c->local_rfd.fd=c->local_wfd.fd=connect_local(c);
-            else
-                break;
-            client_run(c);
-            if(!c->opt->option.retry)
-                break;
-            sleep(1); /* FIXME: not a good idea in ucontext threading */
-            s_poll_free(c->fds);
-            c->fds=NULL;
-            str_stats(); /* client thread allocation tracking */
-            /* c allocation is detached, so it is safe to call str_stats() */
-            if(service_options.next) /* no tls_cleanup() in inetd mode */
-                tls_cleanup();
-        }
-    } else
+        if(c->opt->option.retry)
+            exec_connect_loop(c);
+        else
+            exec_connect_once(c);
+    } else {
         client_run(c);
+    }
+}
+
+void client_free(CLI *c) {
+#ifndef USE_FORK
+    service_free(c->opt);
+#endif
     str_free(c);
 }
 
 #ifdef __GNUC__
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
 #pragma GCC diagnostic push
+#endif /* __GNUC__>=4.6 */
+#pragma GCC diagnostic ignored "-Wformat"
+#pragma GCC diagnostic ignored "-Wformat-extra-args"
+#endif /* __GNUC__ */
+NOEXPORT void exec_connect_loop(CLI *c) {
+    unsigned long long seq=0;
+    char *fresh_id=c->tls->id;
+    unsigned retry;
+
+    do {
+        /* make sure c->tls->id is valid in str_printf() */
+        char *id=str_printf("%s_%llu", fresh_id, seq++);
+        str_detach(id);
+        c->tls->id=id;
+
+        exec_connect_once(c);
+        /* retry is asynchronously changed in the main thread,
+         * so we make sure to use the same value for both checks */
+        retry=c->opt->option.retry;
+        if(retry) {
+            s_log(LOG_INFO, "Retrying an exec+connect section");
+            /* c and id are detached, so it is safe to call str_stats() */
+            str_stats(); /* client thread allocation tracking */
+            s_poll_sleep(1, 0);
+            c->rr++;
+        }
+
+        /* make sure c->tls->id is valid in str_free() */
+        c->tls->id=fresh_id;
+        str_free(id);
+    } while(retry); /* retry is disabled on config reload */
+}
+#ifdef __GNUC__
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
+#pragma GCC diagnostic pop
+#endif /* __GNUC__>=4.6 */
+#endif /* __GNUC__ */
+
+/* exec+connect options specified together
+ * -> spawn a local program instead of stdio */
+NOEXPORT void exec_connect_once(CLI *fresh_c) {
+    jmp_buf exception_buffer, *exception_backup;
+    /* connect_local() needs an unmodified copy of c each time */
+    CLI *c=str_alloc(sizeof(CLI));
+    memcpy(c, fresh_c, sizeof(CLI));
+
+    exception_backup=c->exception_pointer;
+    c->exception_pointer=&exception_buffer;
+    if(!setjmp(exception_buffer)) {
+        c->local_rfd.fd=c->local_wfd.fd=connect_local(c);
+        client_run(c);
+    }
+    c->exception_pointer=exception_backup;
+
+    str_free(c);
+}
+
+#ifdef __GNUC__
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
+#pragma GCC diagnostic push
+#endif /* __GNUC__>=4.6 */
 #pragma GCC diagnostic ignored "-Wformat"
 #pragma GCC diagnostic ignored "-Wformat-extra-args"
 #endif /* __GNUC__ */
 NOEXPORT void client_run(CLI *c) {
+    jmp_buf exception_buffer, *exception_backup;
     int err, rst;
 #ifndef USE_FORK
-    long num_clients_copy;
+    int num;
 #endif
 
 #ifndef USE_FORK
-    CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_CLIENTS]);
-    ui_clients(++num_clients);
-    CRYPTO_THREAD_write_unlock(stunnel_locks[LOCK_CLIENTS]);
+#ifdef USE_OS_THREADS
+    CRYPTO_atomic_add(&num_clients, 1, &num, stunnel_locks[LOCK_CLIENTS]);
+#else
+    num=++num_clients;
+#endif
+    ui_clients(num);
 #endif
 
         /* initialize the client context */
@@ -175,9 +294,14 @@ NOEXPORT void client_run(CLI *c) {
     addrlist_clear(&c->connect_addr, 0);
 
         /* try to process the request */
-    err=setjmp(c->err);
-    if(!err)
+    exception_backup=c->exception_pointer;
+    c->exception_pointer=&exception_buffer;
+    err=setjmp(exception_buffer);
+    if(!err) {
         client_try(c);
+    }
+    c->exception_pointer=exception_backup;
+
     rst=err==1 && c->opt->option.reset;
     s_log(LOG_NOTICE,
         "Connection %s: %llu byte(s) sent to TLS, %llu byte(s) sent to socket",
@@ -240,25 +364,29 @@ NOEXPORT void client_run(CLI *c) {
     /* display child return code if it managed to arrive on time */
     /* otherwise it will be retrieved by the init process and ignored */
     if(c->opt->exec_name) /* 'exec' specified */
-        child_status(); /* null SIGCHLD handler was used */
+        pid_status_hang("Child process"); /* null SIGCHLD handler was used */
     s_log(LOG_DEBUG, "Service [%s] finished", c->opt->servname);
 #else
-    CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_CLIENTS]);
-    ui_clients(--num_clients);
-    num_clients_copy=num_clients; /* to move s_log() away from CRIT_CLIENTS */
-    CRYPTO_THREAD_write_unlock(stunnel_locks[LOCK_CLIENTS]);
-    s_log(LOG_DEBUG, "Service [%s] finished (%ld left)",
-        c->opt->servname, num_clients_copy);
+#ifdef USE_OS_THREADS
+    CRYPTO_atomic_add(&num_clients, -1, &num, stunnel_locks[LOCK_CLIENTS]);
+#else
+    num=--num_clients;
+#endif
+    ui_clients(num);
+    s_log(LOG_DEBUG, "Service [%s] finished (%ld left)", c->opt->servname, num);
 #endif
 
         /* free the client context */
     str_free(c->connect_addr.addr);
-    /* we currently don't make a local copy of c->connect_addr.session */
+    /* a client does not have its own local copy of
+       c->connect_addr.session and c->connect_addr.fd */
     s_poll_free(c->fds);
-    c->fds=NULL;
+    str_free(c->accepted_address);
 }
 #ifdef __GNUC__
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
 #pragma GCC diagnostic pop
+#endif /* __GNUC__>=4.6 */
 #endif /* __GNUC__ */
 
 NOEXPORT void client_try(CLI *c) {
@@ -280,7 +408,6 @@ NOEXPORT void client_try(CLI *c) {
 NOEXPORT void local_start(CLI *c) {
     SOCKADDR_UNION addr;
     socklen_t addr_len;
-    char *accepted_address;
 
     /* check if local_rfd is a socket and get peer address */
     addr_len=sizeof(SOCKADDR_UNION);
@@ -288,12 +415,12 @@ NOEXPORT void local_start(CLI *c) {
     if(c->local_rfd.is_socket) {
         memcpy(&c->peer_addr.sa, &addr.sa, (size_t)addr_len);
         c->peer_addr_len=addr_len;
-        if(set_socket_options(c->local_rfd.fd, 1))
+        if(socket_options_set(c->opt, c->local_rfd.fd, 1))
             s_log(LOG_WARNING, "Failed to set local socket options");
     } else {
         if(get_last_socket_error()!=S_ENOTSOCK) {
             sockerror("getpeerbyname (local_rfd)");
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         }
     }
 
@@ -308,12 +435,12 @@ NOEXPORT void local_start(CLI *c) {
                 memcpy(&c->peer_addr.sa, &addr.sa, (size_t)addr_len);
                 c->peer_addr_len=addr_len;
             }
-            if(set_socket_options(c->local_wfd.fd, 1))
+            if(socket_options_set(c->opt, c->local_wfd.fd, 1))
                 s_log(LOG_WARNING, "Failed to set local socket options");
         } else {
             if(get_last_socket_error()!=S_ENOTSOCK) {
                 sockerror("getpeerbyname (local_wfd)");
-                longjmp(c->err, 1);
+                throw_exception(c, 1);
             }
         }
     }
@@ -323,7 +450,7 @@ NOEXPORT void local_start(CLI *c) {
 #ifndef USE_WIN32
         if(c->opt->option.transparent_src) {
             s_log(LOG_ERR, "Transparent source needs a socket");
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         }
 #endif
         s_log(LOG_NOTICE, "Service [%s] accepted connection", c->opt->servname);
@@ -331,14 +458,13 @@ NOEXPORT void local_start(CLI *c) {
     }
 
     /* authenticate based on retrieved IP address of the client */
-    accepted_address=s_ntop(&c->peer_addr, c->peer_addr_len);
+    c->accepted_address=s_ntop(&c->peer_addr, c->peer_addr_len);
 #ifdef USE_LIBWRAP
-    libwrap_auth(c, accepted_address);
+    libwrap_auth(c);
 #endif /* USE_LIBWRAP */
-    auth_user(c, accepted_address);
+    auth_user(c);
     s_log(LOG_NOTICE, "Service [%s] accepted connection from %s",
-        c->opt->servname, accepted_address);
-    str_free(accepted_address);
+        c->opt->servname, c->accepted_address);
 }
 
 NOEXPORT void remote_start(CLI *c) {
@@ -353,7 +479,7 @@ NOEXPORT void remote_start(CLI *c) {
         c->bind_addr=NULL; /* don't bind */
 
     /* setup c->remote_fd, now */
-    if(c->opt->exec_name && !c->opt->connect_addr.names)
+    if(c->opt->exec_name && !c->opt->connect_addr.names && !redirect(c))
         c->remote_fd.fd=connect_local(c); /* not for exec+connect targets */
     else
         c->remote_fd.fd=connect_remote(c);
@@ -365,7 +491,7 @@ NOEXPORT void remote_start(CLI *c) {
 #endif
     {
         c->remote_fd.is_socket=1;
-        if(set_socket_options(c->remote_fd.fd, 2))
+        if(socket_options_set(c->opt, c->remote_fd.fd, 2))
             s_log(LOG_WARNING, "Failed to set remote socket options");
     }
     s_log(LOG_DEBUG, "Remote descriptor (FD=%ld) initialized",
@@ -374,26 +500,34 @@ NOEXPORT void remote_start(CLI *c) {
 
 NOEXPORT void ssl_start(CLI *c) {
     int i, err;
+    SSL_SESSION *sess;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     int unsafe_openssl;
+#endif /* OpenSSL version < 1.1.0 */
 
     c->ssl=SSL_new(c->opt->ctx);
     if(!c->ssl) {
         sslerror("SSL_new");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     /* for callbacks */
     if(!SSL_set_ex_data(c->ssl, index_ssl_cli, c)) {
         sslerror("SSL_set_ex_data");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     if(c->opt->option.client) {
 #ifndef OPENSSL_NO_TLSEXT
+        /* c->opt->sni should always be initialized at this point,
+         * either explicitly with "sni"
+         * or implicitly with "protocolHost" or "connect" */
         if(c->opt->sni && *c->opt->sni) {
             s_log(LOG_INFO, "SNI: sending servername: %s", c->opt->sni);
             if(!SSL_set_tlsext_host_name(c->ssl, c->opt->sni)) {
                 sslerror("SSL_set_tlsext_host_name");
-                longjmp(c->err, 1);
+                throw_exception(c, 1);
             }
+        } else { /* c->opt->sni was set to an empty value */
+            s_log(LOG_INFO, "SNI: extension disabled");
         }
 #endif
         session_cache_retrieve(c);
@@ -415,47 +549,54 @@ NOEXPORT void ssl_start(CLI *c) {
     else
         s_log(LOG_INFO, "Peer certificate not required");
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     unsafe_openssl=OpenSSL_version_num()<0x0090810fL ||
         (OpenSSL_version_num()>=0x10000000L &&
         OpenSSL_version_num()<0x1000002fL);
+#endif /* OpenSSL version < 1.1.0 */
     while(1) {
         /* critical section for OpenSSL version < 0.9.8p or 1.x.x < 1.0.0b *
          * this critical section is a crude workaround for CVE-2010-3864   *
          * see http://www.securityfocus.com/bid/44884 for details          *
          * alternative solution is to disable internal session caching     *
          * NOTE: this critical section also covers callbacks (e.g. OCSP)   */
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
         if(unsafe_openssl)
             CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_SSL]);
+#endif /* OpenSSL version < 1.1.0 */
 
         if(c->opt->option.client)
             i=SSL_connect(c->ssl);
         else
             i=SSL_accept(c->ssl);
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
         if(unsafe_openssl)
-            CRYPTO_THREAD_write_unlock(stunnel_locks[LOCK_SSL]);
+            CRYPTO_THREAD_unlock(stunnel_locks[LOCK_SSL]);
+#endif /* OpenSSL version < 1.1.0 */
 
         err=SSL_get_error(c->ssl, i);
         if(err==SSL_ERROR_NONE)
             break; /* ok -> done */
         if(err==SSL_ERROR_WANT_READ || err==SSL_ERROR_WANT_WRITE) {
-            s_poll_init(c->fds);
+            s_poll_init(c->fds, 0);
             s_poll_add(c->fds, c->ssl_rfd->fd,
                 err==SSL_ERROR_WANT_READ,
                 err==SSL_ERROR_WANT_WRITE);
             switch(s_poll_wait(c->fds, c->opt->timeout_busy, 0)) {
             case -1:
                 sockerror("ssl_start: s_poll_wait");
-                longjmp(c->err, 1);
+                throw_exception(c, 1);
             case 0:
                 s_log(LOG_INFO, "ssl_start: s_poll_wait:"
                     " TIMEOUTbusy exceeded: sending reset");
-                longjmp(c->err, 1);
+                s_poll_dump(c->fds, LOG_DEBUG);
+                throw_exception(c, 1);
             case 1:
                 break; /* OK */
             default:
                 s_log(LOG_ERR, "ssl_start: s_poll_wait: unknown result");
-                longjmp(c->err, 1);
+                throw_exception(c, 1);
             }
             continue; /* ok -> retry */
         }
@@ -473,100 +614,138 @@ NOEXPORT void ssl_start(CLI *c) {
             sslerror("SSL_connect");
         else
             sslerror("SSL_accept");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
-    s_log(LOG_INFO, "TLS %s: %s",
-        c->opt->option.client ? "connected" : "accepted",
-        SSL_session_reused(c->ssl) ?
-            "previous session reused" : "new session negotiated");
-    if(!SSL_session_reused(c->ssl)) { /* a new session was negotiated */
-        new_chain(c);
-        if(c->opt->option.client)
-            session_cache_save(c);
-        print_cipher(c);
+    print_cipher(c);
+    sess=SSL_get1_session(c->ssl);
+    if(sess) {
+        X509 *peer_cert=SSL_get_peer_certificate(c->ssl);
+        if(peer_cert) {
+            X509_free(peer_cert);
+        } else { /* no authentication was performed */
+            if(!SSL_SESSION_set_ex_data(sess,
+                    index_session_authenticated, NULL)) {
+                sslerror("SSL_SESSION_set_ex_data");
+                SSL_SESSION_free(sess);
+                throw_exception(c, 1);
+            }
+        }
+        if(SSL_session_reused(c->ssl)) {
+            print_session_id(sess);
+        } else { /* a new session was negotiated */
+            /* SSL_SESS_CACHE_NO_INTERNAL_STORE prevented automatic caching */
+            if(!c->opt->option.client)
+                SSL_CTX_add_session(c->opt->ctx, sess);
+        }
+        SSL_SESSION_free(sess);
+    } else if(c->opt->redirect_addr.names) {
+        s_log(LOG_ERR, "No session available for redirection");
+        throw_exception(c, 1);
     }
-}
-
-/* cache client sessions */
-NOEXPORT void session_cache_save(CLI *c) {
-    SSL_SESSION *old1, *old2;
-
-    CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_SESSION]);
-    /* per-destination client cache */
-    /* "parent->" part is added for future use (not currently needed) */
-    old1=c->connect_addr.parent->session[c->idx];
-    c->connect_addr.parent->session[c->idx]=SSL_get1_session(c->ssl);
-    /* per-section client cache (for delayed resolver) */
-    old2=c->opt->session;
-    c->opt->session=SSL_get1_session(c->ssl);
-    CRYPTO_THREAD_write_unlock(stunnel_locks[LOCK_SESSION]);
-    if(old1)
-        SSL_SESSION_free(old1);
-    if(old2)
-        SSL_SESSION_free(old2);
 }
 
 NOEXPORT void session_cache_retrieve(CLI *c) {
+    SSL_SESSION *sess;
+
     CRYPTO_THREAD_read_lock(stunnel_locks[LOCK_SESSION]);
-    /* try per-destination cache first */
-    /* "parent->" part is added for future use (not currently needed) */
-    if(c->connect_addr.parent->session[c->idx])
-        SSL_set_session(c->ssl, c->connect_addr.parent->session[c->idx]);
-    else if(c->opt->session)
-        SSL_set_session(c->ssl, c->opt->session);
-    CRYPTO_THREAD_read_unlock(stunnel_locks[LOCK_SESSION]);
-}
-
-NOEXPORT void new_chain(CLI *c) {
-    BIO *bio;
-    int i, len;
-    X509 *peer_cert;
-    STACK_OF(X509) *sk;
-    char *chain;
-
-    if(c->opt->chain) /* already cached */
-        return; /* this race condition is safe to ignore */
-    bio=BIO_new(BIO_s_mem());
-    if(!bio)
-        return;
-    sk=SSL_get_peer_cert_chain(c->ssl);
-    for(i=0; sk && i<sk_X509_num(sk); i++) {
-        peer_cert=sk_X509_value(sk, i);
-        PEM_write_bio_X509(bio, peer_cert);
-    }
-    if(!sk || !c->opt->option.client) {
-        peer_cert=SSL_get_peer_certificate(c->ssl);
-        if(peer_cert) {
-            PEM_write_bio_X509(bio, peer_cert);
-            X509_free(peer_cert);
+    if(c->opt->option.delayed_lookup) {
+        sess=c->opt->session;
+    } else { /* per-destination client cache */
+        if(c->opt->connect_session) {
+            sess=c->opt->connect_session[c->idx];
+        } else {
+            s_log(LOG_ERR, "INTERNAL ERROR: Uninitialized client session cache");
+            sess=NULL;
         }
     }
-    len=BIO_pending(bio);
-    if(len<=0) {
-        s_log(LOG_INFO, "No peer certificate received");
-        BIO_free(bio);
+    if(sess)
+        SSL_set_session(c->ssl, sess);
+    CRYPTO_THREAD_unlock(stunnel_locks[LOCK_SESSION]);
+}
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+NOEXPORT void print_tmp_key(SSL *s) {
+    EVP_PKEY *key;
+
+#ifdef SSL_CTRL_GET_PEER_TMP_KEY
+    if (!SSL_get_peer_tmp_key(s, &key)) {
+        sslerror("SSL_get_peer_tmp_key");
         return;
     }
-    /* prevent automatic deallocation of the cached value */
-    chain=str_alloc_detached((size_t)len+1);
-    len=BIO_read(bio, chain, len);
-    if(len<0) {
-        s_log(LOG_ERR, "BIO_read failed");
-        BIO_free(bio);
-        str_free(chain);
+#else
+    if (!SSL_get_server_tmp_key(s, &key)) {
+        sslerror("SSL_get_server_tmp_key");
         return;
     }
-    chain[len]='\0';
-    BIO_free(bio);
-    c->opt->chain=chain; /* this race condition is safe to ignore */
-    ui_new_chain(c->opt->section_number);
-    s_log(LOG_DEBUG, "Peer certificate was cached (%d bytes)", len);
+#endif
+    switch (EVP_PKEY_id(key)) {
+    case EVP_PKEY_RSA:
+        s_log(LOG_INFO, "Peer temporary key: RSA, %d bits", EVP_PKEY_bits(key));
+        break;
+    case EVP_PKEY_DH:
+        s_log(LOG_INFO, "Peer temporary key: DH, %d bits", EVP_PKEY_bits(key));
+        break;
+#ifndef OPENSSL_NO_EC
+    case EVP_PKEY_EC:
+        {
+            EC_KEY *ec=EVP_PKEY_get1_EC_KEY(key);
+            int nid=EC_GROUP_get_curve_name(EC_KEY_get0_group(ec));
+            const char *cname=EC_curve_nid2nist(nid);
+            EC_KEY_free(ec);
+            if (cname == NULL)
+                cname=OBJ_nid2sn(nid);
+            s_log(LOG_INFO, "Peer temporary key: ECDH, %s, %d bits", cname, EVP_PKEY_bits(key));
+        }
+        break;
+#endif
+    default:
+        s_log(LOG_INFO, "Peer temporary key: %s, %d bits", OBJ_nid2sn(EVP_PKEY_id(key)),
+                   EVP_PKEY_bits(key));
+    }
+    EVP_PKEY_free(key);
+}
+#endif /* OpenSSL 1.1.1 or later */
+
+NOEXPORT void print_cipher(CLI *c) { /* print negotiated cipher */
+    SSL_CIPHER *cipher;
+#ifndef OPENSSL_NO_COMP
+    const COMP_METHOD *compression, *expansion;
+#endif
+
+    if(c->opt->log_level<LOG_INFO) /* performance optimization */
+        return;
+
+    s_log(LOG_INFO, "TLS %s: %s",
+        c->opt->option.client ? "connected" : "accepted",
+        SSL_session_reused(c->ssl) && !c->flag.psk ?
+            "previous session reused" : "new session negotiated");
+
+    cipher=(SSL_CIPHER *)SSL_get_current_cipher(c->ssl);
+    s_log(LOG_INFO, "%s ciphersuite: %s (%d-bit encryption)",
+        SSL_get_version(c->ssl), SSL_CIPHER_get_name(cipher),
+        SSL_CIPHER_get_bits(cipher, NULL));
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+    print_tmp_key(c->ssl);
+#endif
+
+#ifndef OPENSSL_NO_COMP
+    compression=SSL_get_current_compression(c->ssl);
+    expansion=SSL_get_current_expansion(c->ssl);
+    s_log(compression||expansion ? LOG_INFO : LOG_DEBUG,
+        "Compression: %s, expansion: %s",
+        compression ? SSL_COMP_get_name(compression) : "null",
+        expansion ? SSL_COMP_get_name(expansion) : "null");
+#endif
 }
 
 /****************************** transfer data */
 NOEXPORT void transfer(CLI *c) {
+    int timeout; /* s_poll_wait timeout in seconds */
+    int pending; /* either processed on unprocessed TLS data */
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+    int has_pending=0, prev_has_pending;
+#endif
     int watchdog=0; /* a counter to detect an infinite loop */
-    ssize_t num;
     int err;
     /* logical channels (not file descriptors!) open for read or write */
     int sock_open_rd=1, sock_open_wr=1;
@@ -592,7 +771,7 @@ NOEXPORT void transfer(CLI *c) {
             && c->sock_ptr && !write_wants_read;
 
         /****************************** setup c->fds structure */
-        s_poll_init(c->fds); /* initialize the structure */
+        s_poll_init(c->fds, 0); /* initialize the structure */
         /* for plain socket open data strem = open file descriptor */
         /* make sure to add each open socket to receive exceptions! */
         if(sock_open_rd) /* only poll if the read file descriptor is open */
@@ -609,28 +788,44 @@ NOEXPORT void transfer(CLI *c) {
         }
 
         /****************************** wait for an event */
-        err=s_poll_wait(c->fds,
-            (sock_open_rd && /* both peers open */
+        pending=SSL_pending(c->ssl);
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+        /* only attempt to process SSL_has_pending() data once */
+        prev_has_pending=has_pending;
+        has_pending=SSL_has_pending(c->ssl);
+        pending=pending || (has_pending && !prev_has_pending);
+#endif
+        if(read_wants_read && pending) {
+            timeout=0; /* process any buffered data without delay */
+        } else if((sock_open_rd && /* both peers open */
                 !(SSL_get_shutdown(c->ssl)&SSL_RECEIVED_SHUTDOWN)) ||
-            c->ssl_ptr /* data buffered to write to socket */ ||
-            c->sock_ptr /* data buffered to write to TLS */ ?
-            c->opt->timeout_idle : c->opt->timeout_close, 0);
+                c->ssl_ptr /* data buffered to write to socket */ ||
+                c->sock_ptr /* data buffered to write to TLS */) {
+            timeout=c->opt->timeout_idle;
+        } else {
+            timeout=c->opt->timeout_close;
+        }
+        err=s_poll_wait(c->fds, timeout, 0);
         switch(err) {
         case -1:
             sockerror("transfer: s_poll_wait");
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         case 0: /* timeout */
+            if(read_wants_read && pending)
+                break;
             if((sock_open_rd &&
                     !(SSL_get_shutdown(c->ssl)&SSL_RECEIVED_SHUTDOWN)) ||
                     c->ssl_ptr || c->sock_ptr) {
                 s_log(LOG_INFO, "transfer: s_poll_wait:"
                     " TIMEOUTidle exceeded: sending reset");
-                longjmp(c->err, 1);
-            } else { /* already closing connection */
-                s_log(LOG_ERR, "transfer: s_poll_wait:"
-                    " TIMEOUTclose exceeded: closing");
-                return; /* OK */
+                s_poll_dump(c->fds, LOG_DEBUG);
+                throw_exception(c, 1);
             }
+            /* already closing connection */
+            s_log(LOG_ERR, "transfer: s_poll_wait:"
+                " TIMEOUTclose exceeded: closing");
+            s_poll_dump(c->fds, LOG_DEBUG);
+            return; /* OK */
         }
 
         /****************************** retrieve results from c->fds */
@@ -645,21 +840,18 @@ NOEXPORT void transfer(CLI *c) {
                     s_poll_err(c->fds, c->sock_rfd->fd)) {
                 err=get_socket_error(c->sock_rfd->fd);
                 if(err)
-                    s_log(LOG_ERR, "socket fd: %s (%d)",
-                        s_strerror(err), err);
+                    log_error(LOG_INFO, err, "socket fd");
             }
         } else {
             if(sock_can_rd && s_poll_err(c->fds, c->sock_rfd->fd)) {
                 err=get_socket_error(c->sock_rfd->fd);
                 if(err)
-                    s_log(LOG_ERR, "socket rfd: %s (%d)",
-                        s_strerror(err), err);
+                    log_error(LOG_INFO, err, "socket rfd");
             }
             if(sock_can_wr && s_poll_err(c->fds, c->sock_wfd->fd)) {
                 err=get_socket_error(c->sock_wfd->fd);
                 if(err)
-                    s_log(LOG_ERR, "socket wfd: %s (%d)",
-                        s_strerror(err), err);
+                    log_error(LOG_INFO, err, "socket wfd");
             }
         }
         if(c->ssl_rfd->fd==c->ssl_wfd->fd) {
@@ -667,44 +859,45 @@ NOEXPORT void transfer(CLI *c) {
                     s_poll_err(c->fds, c->ssl_rfd->fd)) {
                 err=get_socket_error(c->ssl_rfd->fd);
                 if(err)
-                    s_log(LOG_ERR, "TLS fd: %s (%d)",
-                        s_strerror(err), err);
+                    log_error(LOG_INFO, err, "TLS fd");
             }
         } else {
             if(ssl_can_rd && s_poll_err(c->fds, c->ssl_rfd->fd)) {
                 err=get_socket_error(c->ssl_rfd->fd);
                 if(err)
-                    s_log(LOG_ERR, "TLS rfd: %s (%d)",
-                        s_strerror(err), err);
+                    log_error(LOG_INFO, err, "TLS rfd");
             }
             if(c->ssl_rfd->fd!=c->ssl_wfd->fd &&
                     ssl_can_wr && s_poll_err(c->fds, c->ssl_wfd->fd)) {
                 err=get_socket_error(c->ssl_wfd->fd);
                 if(err)
-                    s_log(LOG_ERR, "TLS wfd: %s (%d)",
-                        s_strerror(err), err);
+                    log_error(LOG_INFO, err, "TLS wfd");
             }
         }
 
         /****************************** hangups without read or write */
         if(!(sock_can_rd || sock_can_wr || ssl_can_rd || ssl_can_wr)) {
-            if(s_poll_hup(c->fds, c->sock_rfd->fd) ||
-                    s_poll_hup(c->fds, c->sock_wfd->fd)) {
+            if(s_poll_hup(c->fds, c->sock_wfd->fd)) {
                 if(c->ssl_ptr) {
                     s_log(LOG_ERR,
-                        "Socket closed (HUP) with %ld unsent byte(s)",
+                        "Write socket closed (HUP) with %ld unsent byte(s)",
                         (long)c->ssl_ptr);
-                    longjmp(c->err, 1); /* reset the sockets */
+                    throw_exception(c, 1); /* reset the sockets */
                 }
-                s_log(LOG_INFO, "Socket closed (HUP)");
-                sock_open_rd=sock_open_wr=0;
-            } else if(s_poll_hup(c->fds, c->ssl_rfd->fd) ||
+                s_log(LOG_INFO, "Write socket closed (HUP)");
+                sock_open_wr=0;
+            }
+            if(s_poll_hup(c->fds, c->sock_rfd->fd)) {
+                s_log(LOG_INFO, "Read socket closed (HUP)");
+                sock_open_rd=0;
+            }
+            if(s_poll_hup(c->fds, c->ssl_rfd->fd) ||
                     s_poll_hup(c->fds, c->ssl_wfd->fd)) {
                 if(c->sock_ptr) {
                     s_log(LOG_ERR,
                         "TLS socket closed (HUP) with %ld unsent byte(s)",
                         (long)c->sock_ptr);
-                    longjmp(c->err, 1); /* reset the sockets */
+                    throw_exception(c, 1); /* reset the sockets */
                 }
                 s_log(LOG_INFO, "TLS socket closed (HUP)");
                 SSL_set_shutdown(c->ssl,
@@ -714,25 +907,19 @@ NOEXPORT void transfer(CLI *c) {
 
         if(c->reneg_state==RENEG_DETECTED && !c->opt->option.renegotiation) {
             s_log(LOG_ERR, "Aborting due to renegotiation request");
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         }
 
         /****************************** send TLS close_notify alert */
         if(shutdown_wants_read || shutdown_wants_write) {
-            num=SSL_shutdown(c->ssl); /* send close_notify alert */
+            int num=SSL_shutdown(c->ssl); /* send close_notify alert */
             if(num<0) /* -1 - not completed */
-                err=SSL_get_error(c->ssl, (int)num);
+                err=SSL_get_error(c->ssl, num);
             else /* 0 or 1 - success */
                 err=SSL_ERROR_NONE;
             switch(err) {
             case SSL_ERROR_NONE: /* the shutdown was successfully completed */
                 s_log(LOG_INFO, "SSL_shutdown successfully sent close_notify alert");
-                shutdown_wants_read=shutdown_wants_write=0;
-                break;
-            case SSL_ERROR_SYSCALL: /* socket error */
-                if(parse_socket_error(c, "SSL_shutdown"))
-                    break; /* a non-critical error: retry */
-                SSL_set_shutdown(c->ssl, SSL_SENT_SHUTDOWN|SSL_RECEIVED_SHUTDOWN);
                 shutdown_wants_read=shutdown_wants_write=0;
                 break;
             case SSL_ERROR_WANT_WRITE:
@@ -747,16 +934,26 @@ NOEXPORT void transfer(CLI *c) {
                 break;
             case SSL_ERROR_SSL: /* TLS error */
                 sslerror("SSL_shutdown");
-                longjmp(c->err, 1);
+                throw_exception(c, 1);
+            case SSL_ERROR_ZERO_RETURN: /* received a close_notify alert */
+                SSL_set_shutdown(c->ssl, SSL_SENT_SHUTDOWN|SSL_RECEIVED_SHUTDOWN);
+                shutdown_wants_read=shutdown_wants_write=0;
+                break;
+            case SSL_ERROR_SYSCALL: /* socket error */
+                if(parse_socket_error(c, "SSL_shutdown"))
+                    break; /* a non-critical error: retry */
+                SSL_set_shutdown(c->ssl, SSL_SENT_SHUTDOWN|SSL_RECEIVED_SHUTDOWN);
+                shutdown_wants_read=shutdown_wants_write=0;
+                break;
             default:
                 s_log(LOG_ERR, "SSL_shutdown/SSL_get_error returned %d", err);
-                longjmp(c->err, 1);
+                throw_exception(c, 1);
             }
         }
 
         /****************************** write to socket */
         if(sock_open_wr && sock_can_wr) {
-            num=writesocket(c->sock_wfd->fd, c->ssl_buff, c->ssl_ptr);
+            ssize_t num=writesocket(c->sock_wfd->fd, c->ssl_buff, c->ssl_ptr);
             switch(num) {
             case -1: /* error */
                 if(parse_socket_error(c, "writesocket"))
@@ -777,7 +974,7 @@ NOEXPORT void transfer(CLI *c) {
 
         /****************************** read from socket */
         if(sock_open_rd && sock_can_rd) {
-            num=readsocket(c->sock_rfd->fd,
+            ssize_t num=readsocket(c->sock_rfd->fd,
                 c->sock_buff+c->sock_ptr, BUFFSIZE-c->sock_ptr);
             switch(num) {
             case -1:
@@ -805,10 +1002,10 @@ NOEXPORT void transfer(CLI *c) {
         /****************************** write to TLS */
         if((write_wants_read && ssl_can_rd) ||
                 (write_wants_write && ssl_can_wr)) {
+            int num=SSL_write(c->ssl, c->sock_buff, (int)(c->sock_ptr));
             write_wants_read=0;
             write_wants_write=0;
-            num=SSL_write(c->ssl, c->sock_buff, (int)(c->sock_ptr));
-            switch(err=SSL_get_error(c->ssl, (int)num)) {
+            switch(err=SSL_get_error(c->ssl, num)) {
             case SSL_ERROR_NONE:
                 if(num==0) { /* nothing was written: ignore */
                     s_log(LOG_DEBUG, "SSL_write returned 0");
@@ -833,8 +1030,13 @@ NOEXPORT void transfer(CLI *c) {
                 s_log(LOG_DEBUG,
                     "SSL_write returned WANT_X509_LOOKUP: retrying");
                 break;
+            case SSL_ERROR_SSL:
+                sslerror("SSL_write");
+                throw_exception(c, 1);
+            case SSL_ERROR_ZERO_RETURN: /* a buffered close_notify alert */
+                /* fall through */
             case SSL_ERROR_SYSCALL: /* socket error */
-                if(num && parse_socket_error(c, "SSL_write"))
+                if(parse_socket_error(c, "SSL_write") && num) /* always log the error */
                     break; /* a non-critical error: retry */
                 /* EOF -> buggy (e.g. Microsoft) peer:
                  * TLS socket closed without close_notify alert */
@@ -842,34 +1044,26 @@ NOEXPORT void transfer(CLI *c) {
                     s_log(LOG_ERR,
                         "TLS socket closed (SSL_write) with %ld unsent byte(s)",
                         (long)c->sock_ptr);
-                    longjmp(c->err, 1); /* reset the sockets */
+                    throw_exception(c, 1); /* reset the sockets */
                 }
                 s_log(LOG_INFO, "TLS socket closed (SSL_write)");
                 SSL_set_shutdown(c->ssl, SSL_SENT_SHUTDOWN|SSL_RECEIVED_SHUTDOWN);
                 break;
-            case SSL_ERROR_ZERO_RETURN: /* close_notify alert received */
-                s_log(LOG_INFO, "TLS closed (SSL_write)");
-                if(SSL_version(c->ssl)==SSL2_VERSION)
-                    SSL_set_shutdown(c->ssl, SSL_SENT_SHUTDOWN|SSL_RECEIVED_SHUTDOWN);
-                break;
-            case SSL_ERROR_SSL:
-                sslerror("SSL_write");
-                longjmp(c->err, 1);
             default:
                 s_log(LOG_ERR, "SSL_write/SSL_get_error returned %d", err);
-                longjmp(c->err, 1);
+                throw_exception(c, 1);
             }
         }
 
         /****************************** read from TLS */
-        if((read_wants_read && (ssl_can_rd || SSL_pending(c->ssl))) ||
+        if((read_wants_read && (ssl_can_rd || pending)) ||
                 /* it may be possible to read some pending data after
                  * writesocket() above made some room in c->ssl_buff */
                 (read_wants_write && ssl_can_wr)) {
+            int num=SSL_read(c->ssl, c->ssl_buff+c->ssl_ptr, (int)(BUFFSIZE-c->ssl_ptr));
             read_wants_read=0;
             read_wants_write=0;
-            num=SSL_read(c->ssl, c->ssl_buff+c->ssl_ptr, (int)(BUFFSIZE-c->ssl_ptr));
-            switch(err=SSL_get_error(c->ssl, (int)num)) {
+            switch(err=SSL_get_error(c->ssl, num)) {
             case SSL_ERROR_NONE:
                 if(num==0) { /* nothing was read: ignore */
                     s_log(LOG_DEBUG, "SSL_read returned 0");
@@ -892,8 +1086,17 @@ NOEXPORT void transfer(CLI *c) {
                 s_log(LOG_DEBUG,
                     "SSL_read returned WANT_X509_LOOKUP: retrying");
                 break;
+            case SSL_ERROR_SSL:
+                sslerror("SSL_read");
+                throw_exception(c, 1);
+            case SSL_ERROR_ZERO_RETURN: /* received a close_notify alert */
+                s_log(LOG_INFO, "TLS closed (SSL_read)");
+                if(SSL_version(c->ssl)==SSL2_VERSION)
+                    SSL_set_shutdown(c->ssl,
+                        SSL_SENT_SHUTDOWN|SSL_RECEIVED_SHUTDOWN);
+                break;
             case SSL_ERROR_SYSCALL:
-                if(num && parse_socket_error(c, "SSL_read"))
+                if(parse_socket_error(c, "SSL_read") && num) /* always log the error */
                     break; /* a non-critical error: retry */
                 /* EOF -> buggy (e.g. Microsoft) peer:
                  * TLS socket closed without close_notify alert */
@@ -901,24 +1104,15 @@ NOEXPORT void transfer(CLI *c) {
                     s_log(LOG_ERR,
                         "TLS socket closed (SSL_read) with %ld unsent byte(s)",
                         (long)c->sock_ptr);
-                    longjmp(c->err, 1); /* reset the sockets */
+                    throw_exception(c, 1); /* reset the sockets */
                 }
                 s_log(LOG_INFO, "TLS socket closed (SSL_read)");
                 SSL_set_shutdown(c->ssl,
                     SSL_SENT_SHUTDOWN|SSL_RECEIVED_SHUTDOWN);
                 break;
-            case SSL_ERROR_ZERO_RETURN: /* close_notify alert received */
-                s_log(LOG_INFO, "TLS closed (SSL_read)");
-                if(SSL_version(c->ssl)==SSL2_VERSION)
-                    SSL_set_shutdown(c->ssl,
-                        SSL_SENT_SHUTDOWN|SSL_RECEIVED_SHUTDOWN);
-                break;
-            case SSL_ERROR_SSL:
-                sslerror("SSL_read");
-                longjmp(c->err, 1);
             default:
                 s_log(LOG_ERR, "SSL_read/SSL_get_error returned %d", err);
-                longjmp(c->err, 1);
+                throw_exception(c, 1);
             }
         }
 
@@ -935,7 +1129,7 @@ NOEXPORT void transfer(CLI *c) {
                 s_log(LOG_ERR,
                     "Write socket closed (write hangup) with %ld unsent byte(s)",
                     (long)c->ssl_ptr);
-                longjmp(c->err, 1); /* reset the sockets */
+                throw_exception(c, 1); /* reset the sockets */
             }
             s_log(LOG_INFO, "Write socket closed (write hangup)");
             sock_open_wr=0;
@@ -956,7 +1150,7 @@ NOEXPORT void transfer(CLI *c) {
                 s_log(LOG_ERR,
                     "TLS socket closed (write hangup) with %ld unsent byte(s)",
                     (long)c->sock_ptr);
-                longjmp(c->err, 1); /* reset the sockets */
+                throw_exception(c, 1); /* reset the sockets */
             }
             s_log(LOG_INFO, "TLS socket closed (write hangup)");
             SSL_set_shutdown(c->ssl,
@@ -1000,8 +1194,14 @@ NOEXPORT void transfer(CLI *c) {
             s_log(LOG_ERR,
                 "please report the problem to Michal.Trojnara@stunnel.org");
             stunnel_info(LOG_ERR);
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+            s_log(LOG_ERR, "protocol=%s, SSL_pending=%d, SSL_has_pending=%d",
+                SSL_get_version(c->ssl),
+                SSL_pending(c->ssl), SSL_has_pending(c->ssl));
+#else
             s_log(LOG_ERR, "protocol=%s, SSL_pending=%d",
                 SSL_get_version(c->ssl), SSL_pending(c->ssl));
+#endif
             s_log(LOG_ERR, "sock_open_rd=%s, sock_open_wr=%s",
                 sock_open_rd ? "Y" : "n", sock_open_wr ? "Y" : "n");
             s_log(LOG_ERR, "SSL_RECEIVED_SHUTDOWN=%s, SSL_SENT_SHUTDOWN=%s",
@@ -1021,7 +1221,7 @@ NOEXPORT void transfer(CLI *c) {
             s_log(LOG_ERR, "socket input buffer: %ld byte(s), "
                 "TLS input buffer: %ld byte(s)",
                 (long)c->sock_ptr, (long)c->ssl_ptr);
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         }
 
     } while(sock_open_wr || !(SSL_get_shutdown(c->ssl)&SSL_SENT_SHUTDOWN) ||
@@ -1033,8 +1233,10 @@ NOEXPORT int parse_socket_error(CLI *c, const char *text) {
     switch(get_last_socket_error()) {
         /* http://tangentsoft.net/wskfaq/articles/bsd-compatibility.html */
     case 0: /* close on read, or close on write on WIN32 */
+        /* fall through */
 #ifndef USE_WIN32
     case EPIPE: /* close on write on Unix */
+        /* fall through */
 #endif
     case S_ECONNABORTED:
         s_log(LOG_INFO, "%s: Socket is closed", text);
@@ -1044,7 +1246,7 @@ NOEXPORT int parse_socket_error(CLI *c, const char *text) {
         return 1;
     case S_EWOULDBLOCK:
         s_log(LOG_NOTICE, "%s: Would block: retrying", text);
-        sleep(1); /* Microsoft bug KB177346 */
+        s_poll_sleep(1, 0); /* Microsoft bug KB177346 */
         return 1;
 #if S_EAGAIN!=S_EWOULDBLOCK
     case S_EAGAIN:
@@ -1060,42 +1262,21 @@ NOEXPORT int parse_socket_error(CLI *c, const char *text) {
             return 0;
         }
 #endif
+        /* fall through */
     default:
         sockerror(text);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
         return -1; /* some C compilers require a return value */
     }
 }
 
-NOEXPORT void print_cipher(CLI *c) { /* print negotiated cipher */
-    SSL_CIPHER *cipher;
-#ifndef OPENSSL_NO_COMP
-    const COMP_METHOD *compression, *expansion;
-#endif
-
-    if(c->opt->log_level<LOG_INFO) /* performance optimization */
-        return;
-    cipher=(SSL_CIPHER *)SSL_get_current_cipher(c->ssl);
-    s_log(LOG_INFO, "Negotiated %s ciphersuite %s (%d-bit encryption)",
-        SSL_get_version(c->ssl), SSL_CIPHER_get_name(cipher),
-        SSL_CIPHER_get_bits(cipher, NULL));
-
-#ifndef OPENSSL_NO_COMP
-    compression=SSL_get_current_compression(c->ssl);
-    expansion=SSL_get_current_expansion(c->ssl);
-    s_log(compression||expansion ? LOG_INFO : LOG_DEBUG,
-        "Compression: %s, expansion: %s",
-        compression ? SSL_COMP_get_name(compression) : "null",
-        expansion ? SSL_COMP_get_name(expansion) : "null");
-#endif
-}
-
-NOEXPORT void auth_user(CLI *c, char *accepted_address) {
+NOEXPORT void auth_user(CLI *c) {
 #ifndef _WIN32_WCE
     struct servent *s_ent;    /* structure for getservbyname */
 #endif
     SOCKADDR_UNION ident;     /* IDENT socket name */
     char *line, *type, *system, *user;
+    unsigned remote_port, local_port;
 
     if(!c->opt->username)
         return; /* -u option not specified */
@@ -1108,7 +1289,7 @@ NOEXPORT void auth_user(CLI *c, char *accepted_address) {
     c->fd=s_socket(c->peer_addr.sa.sa_family, SOCK_STREAM,
         0, 1, "socket (auth_user)");
     if(c->fd==INVALID_SOCKET)
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     memcpy(&ident, &c->peer_addr, (size_t)c->peer_addr_len);
 #ifndef _WIN32_WCE
     s_ent=getservbyname("auth", "tcp");
@@ -1121,11 +1302,12 @@ NOEXPORT void auth_user(CLI *c, char *accepted_address) {
         ident.in.sin_port=htons(113);
     }
     if(s_connect(c, &ident, addr_len(&ident)))
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     s_log(LOG_DEBUG, "IDENT server connected");
-    fd_printf(c, c->fd, "%u , %u",
-        ntohs(c->peer_addr.in.sin_port),
-        ntohs(c->opt->local_addr.in.sin_port));
+    remote_port=ntohs(c->peer_addr.in.sin_port);
+    local_port=(unsigned)(c->opt->local_addr.addr ?
+        ntohs(c->opt->local_addr.addr[0].in.sin_port) : 0);
+    fd_printf(c, c->fd, "%u , %u", remote_port, local_port);
     line=fd_getline(c, c->fd);
     closesocket(c->fd);
     c->fd=INVALID_SOCKET; /* avoid double close on cleanup */
@@ -1133,35 +1315,35 @@ NOEXPORT void auth_user(CLI *c, char *accepted_address) {
     if(!type) {
         s_log(LOG_ERR, "Malformed IDENT response");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     *type++='\0';
     system=strchr(type, ':');
     if(!system) {
         s_log(LOG_ERR, "Malformed IDENT response");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     *system++='\0';
     if(strcmp(type, " USERID ")) {
-        s_log(LOG_ERR, "Incorrect INETD response type");
+        s_log(LOG_ERR, "Incorrect IDENT response type");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     user=strchr(system, ':');
     if(!user) {
         s_log(LOG_ERR, "Malformed IDENT response");
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     *user++='\0';
     while(*user==' ') /* skip leading spaces */
         ++user;
     if(strcmp(user, c->opt->username)) {
         s_log(LOG_WARNING, "Connection from %s REFUSED by IDENT (user \"%s\")",
-            accepted_address, user);
+            c->accepted_address, user);
         str_free(line);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     s_log(LOG_INFO, "IDENT authentication passed");
     str_free(line);
@@ -1171,7 +1353,7 @@ NOEXPORT void auth_user(CLI *c, char *accepted_address) {
 
 NOEXPORT int connect_local(CLI *c) { /* spawn local process */
     s_log(LOG_ERR, "Local mode is not supported on this platform");
-    longjmp(c->err, 1);
+    throw_exception(c, 1);
     return -1; /* some C compilers require a return value */
 }
 
@@ -1184,7 +1366,7 @@ NOEXPORT SOCKET connect_local(CLI *c) { /* spawn local process */
     LPTSTR name, args;
 
     if(make_sockets(fd))
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     memset(&si, 0, sizeof si);
     si.cb=sizeof si;
     si.dwFlags=STARTF_USESHOWWINDOW|STARTF_USESTDHANDLES;
@@ -1219,11 +1401,11 @@ NOEXPORT SOCKET connect_local(CLI *c) { /* spawn local process */
         char tty[64];
 
         if(pty_allocate(fd, fd+1, tty))
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         s_log(LOG_DEBUG, "TTY=%s allocated", tty);
     } else
         if(make_sockets(fd))
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
     set_nonblock(fd[1], 0); /* switch back to the blocking mode */
 
     env=env_alloc(c);
@@ -1235,7 +1417,7 @@ NOEXPORT SOCKET connect_local(CLI *c) { /* spawn local process */
         closesocket(fd[1]);
         env_free(env);
         ioerror("fork");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     case  0:    /* child */
         /* the child is not allowed to play with thread-local storage */
         /* see http://linux.die.net/man/3/pthread_atfork for details */
@@ -1243,7 +1425,7 @@ NOEXPORT SOCKET connect_local(CLI *c) { /* spawn local process */
         /* dup2() does not copy FD_CLOEXEC flag */
         dup2(fd[1], 0);
         dup2(fd[1], 1);
-        if(!global_options.option.log_stderr)
+        if(!c->opt->option.log_stderr)
             dup2(fd[1], 2);
         closesocket(fd[1]); /* not really needed due to FD_CLOEXEC */
 #ifdef HAVE_PTHREAD_SIGMASK
@@ -1253,6 +1435,7 @@ NOEXPORT SOCKET connect_local(CLI *c) { /* spawn local process */
         signal(SIGCHLD, SIG_DFL);
         signal(SIGHUP, SIG_DFL);
         signal(SIGUSR1, SIG_DFL);
+        signal(SIGUSR2, SIG_DFL);
         signal(SIGPIPE, SIG_DFL);
         signal(SIGTERM, SIG_DFL);
         signal(SIGQUIT, SIG_DFL);
@@ -1341,7 +1524,7 @@ NOEXPORT SOCKET connect_remote(CLI *c) {
     switch(c->connect_addr.num) {
     case 0:
         s_log(LOG_ERR, "No remote host resolved");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     case 1:
         idx_start=0;
         break;
@@ -1355,9 +1538,13 @@ NOEXPORT SOCKET connect_remote(CLI *c) {
         if(!connect_init(c, c->connect_addr.addr[c->idx].sa.sa_family) &&
                 !s_connect(c, &c->connect_addr.addr[c->idx],
                     addr_len(&c->connect_addr.addr[c->idx]))) {
-            if(c->ssl)
-                idx_cache_save(SSL_get_session(c->ssl),
-                    &c->connect_addr.addr[c->idx]);
+            if(c->ssl) {
+                SSL_SESSION *sess=SSL_get1_session(c->ssl);
+                if(sess) {
+                    idx_cache_save(sess, &c->connect_addr.addr[c->idx]);
+                    SSL_SESSION_free(sess);
+                }
+            }
             print_bound_address(c);
             fd=c->fd;
             c->fd=INVALID_SOCKET;
@@ -1369,7 +1556,7 @@ NOEXPORT SOCKET connect_remote(CLI *c) {
         }
     }
     s_log(LOG_ERR, "No more addresses to connect");
-    longjmp(c->err, 1);
+    throw_exception(c, 1);
     return INVALID_SOCKET; /* some C compilers require a return value */
 }
 
@@ -1377,6 +1564,7 @@ NOEXPORT void idx_cache_save(SSL_SESSION *sess, SOCKADDR_UNION *cur_addr) {
     SOCKADDR_UNION *old_addr, *new_addr;
     socklen_t len;
     char *addr_txt;
+    int ok;
 
     /* make a copy of the address, so it may work with delayed resolver */
     len=addr_len(cur_addr);
@@ -1389,10 +1577,14 @@ NOEXPORT void idx_cache_save(SSL_SESSION *sess, SOCKADDR_UNION *cur_addr) {
 
     CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_ADDR]);
     old_addr=SSL_SESSION_get_ex_data(sess, index_session_connect_address);
-    /* we can safely ignore the SSL_SESSION_set_ex_data() failure */
-    SSL_SESSION_set_ex_data(sess, index_session_connect_address, new_addr);
-    CRYPTO_THREAD_write_unlock(stunnel_locks[LOCK_ADDR]);
-    str_free(old_addr); /* NULL pointers are ignored */
+    ok=SSL_SESSION_set_ex_data(sess, index_session_connect_address, new_addr);
+    CRYPTO_THREAD_unlock(stunnel_locks[LOCK_ADDR]);
+    if(ok) {
+        str_free(old_addr); /* NULL pointers are ignored */
+    } else { /* failed to store new_addr -> remove it */
+        sslerror("SSL_SESSION_set_ex_data");
+        str_free(new_addr); /* NULL pointers are ignored */
+    }
 }
 
 NOEXPORT unsigned idx_cache_retrieve(CLI *c) {
@@ -1402,37 +1594,39 @@ NOEXPORT unsigned idx_cache_retrieve(CLI *c) {
     char *addr_txt;
 
     if(c->ssl && SSL_session_reused(c->ssl)) {
-        CRYPTO_THREAD_read_lock(stunnel_locks[LOCK_ADDR]);
-        ptr=SSL_SESSION_get_ex_data(SSL_get_session(c->ssl),
-            index_session_connect_address);
-        if(ptr) {
-            len=addr_len(ptr);
-            memcpy(&addr, ptr, (size_t)len);
-            CRYPTO_THREAD_read_unlock(stunnel_locks[LOCK_ADDR]);
-            /* address was copied, ptr itself is no longer valid */
-            for(i=0; i<c->connect_addr.num; ++i) {
-                if(addr_len(&c->connect_addr.addr[i])==len &&
-                        !memcmp(&c->connect_addr.addr[i],
-                            &addr, (size_t)len)) {
-                    addr_txt=s_ntop(&addr, len);
-                    s_log(LOG_INFO, "persistence: %s reused", addr_txt);
-                    str_free(addr_txt);
-                    return i;
+        SSL_SESSION *sess=SSL_get1_session(c->ssl);
+        if(sess) {
+            CRYPTO_THREAD_read_lock(stunnel_locks[LOCK_ADDR]);
+            ptr=SSL_SESSION_get_ex_data(sess, index_session_connect_address);
+            if(ptr) {
+                len=addr_len(ptr);
+                memcpy(&addr, ptr, (size_t)len);
+                CRYPTO_THREAD_unlock(stunnel_locks[LOCK_ADDR]);
+                SSL_SESSION_free(sess);
+                /* address was copied, ptr itself is no longer valid */
+                for(i=0; i<c->connect_addr.num; ++i) {
+                    if(addr_len(&c->connect_addr.addr[i])==len &&
+                            !memcmp(&c->connect_addr.addr[i],
+                                &addr, (size_t)len)) {
+                        addr_txt=s_ntop(&addr, len);
+                        s_log(LOG_INFO, "persistence: %s reused", addr_txt);
+                        str_free(addr_txt);
+                        return i;
+                    }
                 }
+                addr_txt=s_ntop(&addr, len);
+                s_log(LOG_INFO, "persistence: %s not available", addr_txt);
+                str_free(addr_txt);
+            } else {
+                CRYPTO_THREAD_unlock(stunnel_locks[LOCK_ADDR]);
+                SSL_SESSION_free(sess);
+                s_log(LOG_NOTICE, "persistence: No cached address found");
             }
-            addr_txt=s_ntop(&addr, len);
-            s_log(LOG_INFO, "persistence: %s not available", addr_txt);
-            str_free(addr_txt);
-        } else {
-            CRYPTO_THREAD_read_unlock(stunnel_locks[LOCK_ADDR]);
-            s_log(LOG_NOTICE, "persistence: No cached address found");
         }
     }
 
     if(c->opt->failover==FAILOVER_RR) {
-        /* the race condition here can be safely ignored */
-        i=c->connect_addr.parent->rr;
-        c->connect_addr.parent->rr=(i+1)%c->connect_addr.num;
+        i=(c->connect_addr.start+c->rr)%c->connect_addr.num;
         s_log(LOG_INFO, "failover: round-robin, starting at entry #%d", i);
     } else {
         i=0;
@@ -1442,10 +1636,7 @@ NOEXPORT unsigned idx_cache_retrieve(CLI *c) {
 }
 
 NOEXPORT void connect_setup(CLI *c) {
-    /* process "redirect" first */
-    if(c->opt->redirect_addr.names &&
-            (!c->ssl || !SSL_SESSION_get_ex_data(SSL_get_session(c->ssl),
-                index_session_authenticated))) {
+    if(redirect(c)) { /* process "redirect" first */
         s_log(LOG_NOTICE, "Redirecting connection");
         /* c->connect_addr.addr may be allocated in protocol negotiations */
         str_free(c->connect_addr.addr);
@@ -1463,7 +1654,7 @@ NOEXPORT void connect_setup(CLI *c) {
         c->connect_addr.num=1;
         c->connect_addr.addr=str_alloc(sizeof(SOCKADDR_UNION));
         if(original_dst(c->local_rfd.fd, c->connect_addr.addr))
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         return;
     }
 
@@ -1542,7 +1733,7 @@ NOEXPORT int connect_init(CLI *c, int domain) {
         /* FIXME: move this check to options.c */
         s_log(LOG_ERR, "Transparent proxy in remote mode is not supported"
             " on this platform");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
 #endif
     }
 #endif /* !defined(USE_WIN32) */
@@ -1570,6 +1761,22 @@ NOEXPORT int connect_init(CLI *c, int domain) {
     return 1; /* failure */
 }
 
+NOEXPORT int redirect(CLI *c) {
+    SSL_SESSION *sess;
+    void *ex_data;
+
+    if(!c->opt->redirect_addr.names)
+        return 0; /* redirect not configured */
+    if(!c->ssl)
+        return 1; /* TLS not established -> always redirect */
+    sess=SSL_get1_session(c->ssl);
+    if(!sess)
+        return 1; /* no TLS session -> always redirect */
+    ex_data=SSL_SESSION_get_ex_data(sess, index_session_authenticated);
+    SSL_SESSION_free(sess);
+    return ex_data == NULL;
+}
+
 NOEXPORT void print_bound_address(CLI *c) {
     char *txt;
     SOCKADDR_UNION addr;
@@ -1595,6 +1802,12 @@ NOEXPORT void reset(SOCKET fd, char *txt) { /* set lingering on a socket */
     l.l_linger=0;
     if(setsockopt(fd, SOL_SOCKET, SO_LINGER, (void *)&l, sizeof l))
         log_error(LOG_DEBUG, get_last_socket_error(), txt);
+}
+
+void throw_exception(CLI *c, int v) {
+    if(!c || !c->exception_pointer)
+        fatal("No exception handler");
+    longjmp(*c->exception_pointer, v);
 }
 
 /* end of client.c */

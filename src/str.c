@@ -1,6 +1,6 @@
 /*
  *   stunnel       TLS offloading and load-balancing proxy
- *   Copyright (C) 1998-2017 Michal Trojnara <Michal.Trojnara@stunnel.org>
+ *   Copyright (C) 1998-2021 Michal Trojnara <Michal.Trojnara@stunnel.org>
  *
  *   This program is free software; you can redistribute it and/or modify it
  *   under the terms of the GNU General Public License as published by the
@@ -38,6 +38,9 @@
 #include "common.h"
 #include "prototypes.h"
 
+/* Uncomment to see allocation sources in core dumps */
+/* #define DEBUG_PADDING 64 */
+
 /* reportedly, malloc does not always return 16-byte aligned addresses
  * for 64-bit targets as specified by
  * https://msdn.microsoft.com/en-us/library/6ewkz86d.aspx */
@@ -66,6 +69,9 @@ struct alloc_list_struct {
     size_t size;
     const char *alloc_file, *free_file;
     int alloc_line, free_line;
+#ifdef DEBUG_PADDING
+    char debug[DEBUG_PADDING];
+#endif
     uint64_t valid_canary, magic;
 #ifdef __GNUC__
 } __attribute__((aligned(16)));
@@ -84,7 +90,7 @@ typedef struct {
 } LEAK_ENTRY;
 NOEXPORT LEAK_ENTRY leak_hash_table[LEAK_TABLE_SIZE],
     *leak_results[LEAK_TABLE_SIZE];
-NOEXPORT volatile int leak_result_num=0;
+NOEXPORT int leak_result_num=0;
 
 #ifdef USE_WIN32
 NOEXPORT LPTSTR str_vtprintf(LPCTSTR, va_list);
@@ -116,7 +122,19 @@ NOEXPORT volatile uint64_t canary_initialized=CANARY_UNINTIALIZED;
 char *str_dup_debug(const char *str, const char *file, int line) {
     char *retval;
 
+    if(!str)
+        return NULL;
     retval=str_alloc_debug(strlen(str)+1, file, line);
+    strcpy(retval, str);
+    return retval;
+}
+
+char *str_dup_detached_debug(const char *str, const char *file, int line) {
+    char *retval;
+
+    if(!str)
+        return NULL;
+    retval=str_alloc_detached_debug(strlen(str)+1, file, line);
     strcpy(retval, str);
     return retval;
 }
@@ -132,7 +150,9 @@ char *str_printf(const char *format, ...) {
 }
 
 #ifdef __GNUC__
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
 #pragma GCC diagnostic push
+#endif /* __GNUC__>=4.6 */
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
 #endif /* __GNUC__ */
 char *str_vprintf(const char *format, va_list start_ap) {
@@ -155,7 +175,9 @@ char *str_vprintf(const char *format, va_list start_ap) {
     }
 }
 #ifdef __GNUC__
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
 #pragma GCC diagnostic pop
+#endif /* __GNUC__>=4.6 */
 #endif /* __GNUC__ */
 
 #ifdef USE_WIN32
@@ -246,7 +268,7 @@ void *str_alloc_debug(size_t size, const char *file, int line) {
     tls_data=tls_get();
     if(!tls_data) {
         tls_data=tls_alloc(NULL, NULL, "alloc");
-        s_log(LOG_ERR, "INTERNAL ERROR: Uninitialized TLS at %s, line %d",
+        s_log(LOG_CRIT, "INTERNAL ERROR: Uninitialized TLS at %s, line %d",
             file, line);
     }
 
@@ -281,6 +303,10 @@ void *str_alloc_detached_debug(size_t size, const char *file, int line) {
     alloc_list->alloc_line=line;
     alloc_list->free_file="none";
     alloc_list->free_line=0;
+#ifdef DEBUG_PADDING
+    snprintf(alloc_list->debug+1, DEBUG_PADDING-1, "ALLOC_%lu@%s:%d",
+        (unsigned long)size, file, line);
+#endif
     alloc_list->valid_canary=canary_initialized; /* before memcpy */
     memcpy((uint8_t *)(alloc_list+1)+size, canary, sizeof canary);
     alloc_list->magic=MAGIC_ALLOCATED;
@@ -332,6 +358,10 @@ NOEXPORT void *str_realloc_internal_debug(void *ptr, size_t size, const char *fi
     alloc_list->alloc_line=line;
     alloc_list->free_file="none";
     alloc_list->free_line=0;
+#ifdef DEBUG_PADDING
+    snprintf(alloc_list->debug+1, DEBUG_PADDING-1, "ALLOC_%lu@%s:%d",
+        (unsigned long)size, file, line);
+#endif
     alloc_list->valid_canary=canary_initialized; /* before memcpy */
     memcpy((uint8_t *)ptr+size, canary, sizeof canary);
     str_leak_debug(alloc_list, 1);
@@ -372,8 +402,8 @@ void str_free_debug(void *ptr, const char *file, int line) {
     alloc_list=(ALLOC_LIST *)ptr-1;
     if(alloc_list->magic==MAGIC_DEALLOCATED) { /* double free */
         /* this may (unlikely) log garbage instead of file names */
-        s_log(LOG_CRIT,
-            "Double free attempt: ptr=%p alloc=%s:%d free#1=%s:%d free#2=%s:%d",
+        s_log(LOG_CRIT, "INTERNAL ERROR: Double free attempt: "
+                "ptr=%p alloc=%s:%d free#1=%s:%d free#2=%s:%d",
             ptr,
             alloc_list->alloc_file, alloc_list->alloc_line,
             alloc_list->free_file, alloc_list->free_line,
@@ -410,12 +440,15 @@ NOEXPORT ALLOC_LIST *get_alloc_list_ptr(void *ptr, const char *file, int line) {
 NOEXPORT void str_leak_debug(const ALLOC_LIST *alloc_list, int change) {
     static size_t entries=0;
     LEAK_ENTRY *entry;
-    int new_entry, allocations;
+    int new_entry;
+    int allocations;
 
-#ifndef USE_FORK
+    if(service_options.log_level<LOG_DEBUG) /* performance optimization */
+        return;
+#ifdef USE_OS_THREADS
     if(!stunnel_locks[STUNNEL_LOCKS-1]) /* threads not initialized */
         return;
-#endif
+#endif /* USE_OS_THREADS */
     if(!number_of_sections) /* configuration file not initialized */
         return;
 
@@ -429,23 +462,33 @@ NOEXPORT void str_leak_debug(const ALLOC_LIST *alloc_list, int change) {
         entry=leak_search(alloc_list); /* the list may have changed */
         if(entry->alloc_line==0) {
             if(entries>LEAK_TABLE_SIZE-100) { /* this should never happen */
-                CRYPTO_THREAD_write_unlock(stunnel_locks[LOCK_LEAK_HASH]);
+                CRYPTO_THREAD_unlock(stunnel_locks[LOCK_LEAK_HASH]);
                 return;
             }
             entries++;
             entry->alloc_line=alloc_list->alloc_line;
             entry->alloc_file=alloc_list->alloc_file;
         }
-        CRYPTO_THREAD_write_unlock(stunnel_locks[LOCK_LEAK_HASH]);
+        CRYPTO_THREAD_unlock(stunnel_locks[LOCK_LEAK_HASH]);
     }
 
-#ifdef PRECISE_LEAK_ALLOCATON_COUNTERS
-    /* this is *really* slow in OpenSSL < 1.1.0 */
+    /* for performance we try to avoid calling CRYPTO_atomic_add() here */
+#ifdef USE_OS_THREADS
+#if defined(__GNUC__) && defined(__ATOMIC_ACQ_REL)
+    if(__atomic_is_lock_free(sizeof entry->num, &entry->num))
+        allocations=__atomic_add_fetch(&entry->num, change, __ATOMIC_ACQ_REL);
+    else
+        CRYPTO_atomic_add(&entry->num, change, &allocations,
+            stunnel_locks[LOCK_LEAK_HASH]);
+#elif defined(_MSC_VER)
+    allocations=InterlockedExchangeAdd(&entry->num, change)+change;
+#else /* atomic add not directly supported by the compiler */
     CRYPTO_atomic_add(&entry->num, change, &allocations,
         stunnel_locks[LOCK_LEAK_HASH]);
-#else
-    allocations=(entry->num+=change); /* we just need an estimate... */
 #endif
+#else /* USE_OS_THREADS */
+    allocations=(entry->num+=change);
+#endif /* USE_OS_THREADS */
 
     if(allocations<=leak_threshold()) /* leak not detected */
         return;
@@ -458,19 +501,17 @@ NOEXPORT void str_leak_debug(const ALLOC_LIST *alloc_list, int change) {
     /* we *may* need to allocate a new leak_results entry */
     /* locking is slow, so we try to avoid it if possible */
     CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_LEAK_RESULTS]);
-    if(entry->max==0) { /* the table may have changed */
-        leak_results[leak_result_num]=entry;
-        entry->max=allocations;
-        ++leak_result_num; /* at the end to avoid a lock in leak_report() */
-    } else { /* gracefully handle the race condition */
-        entry->max=allocations;
-    }
-    CRYPTO_THREAD_write_unlock(stunnel_locks[LOCK_LEAK_RESULTS]);
+    if(entry->max==0) /* the table may have changed */
+        leak_results[leak_result_num++]=entry;
+    entry->max=allocations;
+    CRYPTO_THREAD_unlock(stunnel_locks[LOCK_LEAK_RESULTS]);
 }
 
 /* O(1) hash table lookup */
 NOEXPORT LEAK_ENTRY *leak_search(const ALLOC_LIST *alloc_list) {
-    int i=alloc_list->alloc_line%LEAK_TABLE_SIZE;
+    /* a trivial hash based on source file name *address* and line number */
+    unsigned i=((unsigned)(uintptr_t)alloc_list->alloc_file+
+        (unsigned)alloc_list->alloc_line)%LEAK_TABLE_SIZE;
 
     while(!(leak_hash_table[i].alloc_line==0 ||
             (leak_hash_table[i].alloc_line==alloc_list->alloc_line &&
@@ -479,18 +520,37 @@ NOEXPORT LEAK_ENTRY *leak_search(const ALLOC_LIST *alloc_list) {
     return leak_hash_table+i;
 }
 
+void leak_table_utilization() {
+    int i, utilization=0;
+
+    for(i=0; i<LEAK_TABLE_SIZE; ++i) {
+        if(leak_hash_table[i].alloc_line) {
+            ++utilization;
+#if 0
+            s_log(LOG_DEBUG, "Leak hash entry %d: %s:%d", i,
+                leak_hash_table[i].alloc_file, leak_hash_table[i].alloc_line);
+#endif
+        }
+    }
+    s_log(LOG_DEBUG, "Leak detection table utilization: %d/%d, %02.2f%%",
+        utilization, LEAK_TABLE_SIZE, 100.0*utilization/LEAK_TABLE_SIZE);
+}
+
 /* report identified leaks */
 NOEXPORT void leak_report() {
     int i;
     long limit;
 
     limit=leak_threshold();
+
+    CRYPTO_THREAD_read_lock(stunnel_locks[LOCK_LEAK_RESULTS]);
     for(i=0; i<leak_result_num; ++i)
         if(leak_results[i] /* an officious compiler could reorder code */ &&
                 leak_results[i]->max>limit /* the limit could have changed */)
             s_log(LOG_WARNING, "Possible memory leak at %s:%d: %d allocations",
                 leak_results[i]->alloc_file, leak_results[i]->alloc_line,
                 leak_results[i]->max);
+    CRYPTO_THREAD_unlock(stunnel_locks[LOCK_LEAK_RESULTS]);
 }
 
 NOEXPORT long leak_threshold() {
@@ -508,11 +568,33 @@ NOEXPORT long leak_threshold() {
 /* a version of memcmp() with execution time not dependent on data values */
 /* it does *not* allow testing whether s1 is greater or lesser than s2  */
 int safe_memcmp(const void *s1, const void *s2, size_t n) {
-    uint8_t *p1=(uint8_t *)s1, *p2=(uint8_t *)s2;
-    int r=0;
+#ifdef _WIN64
+    typedef unsigned long long TL;
+#else
+    typedef unsigned long TL;
+#endif
+    typedef unsigned char TS;
+    TL r=0, *pl1, *pl2;
+    TS *ps1, *ps2;
+    int n1=(int)((uintptr_t)s1&(sizeof(TL)-1)); /* unaligned bytes in s1 */
+    int n2=(int)((uintptr_t)s2&(sizeof(TL)-1)); /* unaligned bytes in s2 */
+
+    if(n1 || n2) { /* either pointer unaligned */
+        ps1=(TS *)s1;
+        ps2=(TS *)s2;
+    } else { /* both pointers aligned -> compare full words */
+        pl1=(TL *)s1;
+        pl2=(TL *)s2;
+        while(n>=sizeof(TL)) {
+            n-=sizeof(TL);
+            r|=(*pl1++)^(*pl2++);
+        }
+        ps1=(TS *)pl1;
+        ps2=(TS *)pl2;
+    }
     while(n--)
-        r|=(*p1++)^(*p2++);
-    return r;
+        r|=(*ps1++)^(*ps2++);
+    return r!=0;
 }
 
 /* end of str.c */

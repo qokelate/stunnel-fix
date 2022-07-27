@@ -1,5 +1,5 @@
 ## Process this file with automake to produce Makefile.in
-# by Michal Trojnara 2015-2017
+# by Michal Trojnara 1998-2021
 
 ###############################################################################
 # File lists                                                                  #
@@ -16,17 +16,6 @@ win32_gui_sources += stunnel.ico active.ico error.ico idle.ico
 win32_cli_sources = ui_win_cli.c
 
 ###############################################################################
-# Generate a new set of DH parameters for each version                        #
-###############################################################################
-
-dhparam.c: version.h
-	echo '#include "common.h"' >dhparam.c
-	echo '#ifndef OPENSSL_NO_DH' >>dhparam.c
-	echo '#define DN_new DH_new' >>dhparam.c
-	openssl dhparam -noout -C 2048 >>dhparam.c
-	echo '#endif /* OPENSSL_NO_DH */' >>dhparam.c
-
-###############################################################################
 # Unix executables and shared library                                         #
 ###############################################################################
 
@@ -38,7 +27,7 @@ EXTRA_DIST = stunnel3.in
 CLEANFILES = stunnel3
 
 # Red Hat "by design" bug #82369
-stunnel_CPPFLAGS = -I/usr/kerberos/include
+stunnel_CPPFLAGS = -I$(SYSROOT)/usr/kerberos/include
 
 # Additional preprocesor definitions
 stunnel_CPPFLAGS += -I$(SSLDIR)/include
@@ -64,15 +53,12 @@ libstunnel_la_LDFLAGS = -avoid-version
 # Win32 executables                                                           #
 ###############################################################################
 
-if AUTHOR_TESTS
-# Just check if the programs can be built, don't perform any actual tests
-check-local: mingw mingw64
-endif
-
 mingw:
-	$(MAKE) -f $(srcdir)/mingw.mk srcdir=$(srcdir) win32_targetcpu=i686 win32_mingw=mingw
+	$(MAKE) -f $(srcdir)/mingw.mk srcdir=$(srcdir) win32_arch=win32 win32_targetcpu=i686 win32_mingw=mingw
+
 mingw64:
-	$(MAKE) -f $(srcdir)/mingw.mk srcdir=$(srcdir) win32_targetcpu=x86_64 win32_mingw=mingw64
+	$(MAKE) -f $(srcdir)/mingw.mk srcdir=$(srcdir) win32_arch=win64 win32_targetcpu=x86_64 win32_mingw=mingw64
+
 .PHONY: mingw mingw64
 
 clean-local:

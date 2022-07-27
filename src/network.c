@@ -1,6 +1,6 @@
 /*
  *   stunnel       TLS offloading and load-balancing proxy
- *   Copyright (C) 1998-2017 Michal Trojnara <Michal.Trojnara@stunnel.org>
+ *   Copyright (C) 1998-2021 Michal Trojnara <Michal.Trojnara@stunnel.org>
  *
  *   This program is free software; you can redistribute it and/or modify it
  *   under the terms of the GNU General Public License as published by the
@@ -46,6 +46,9 @@
 /* #define DEBUG_UCONTEXT */
 
 NOEXPORT void s_poll_realloc(s_poll_set *);
+#ifndef USE_UCONTEXT
+NOEXPORT void check_terminate(s_poll_set *);
+#endif
 
 /**************************************** s_poll functions */
 
@@ -63,10 +66,12 @@ void s_poll_free(s_poll_set *fds) {
     }
 }
 
-void s_poll_init(s_poll_set *fds) {
+void s_poll_init(s_poll_set *fds, int main_thread) {
     fds->nfds=0;
     fds->allocated=4; /* prealloc 4 file descriptors */
     s_poll_realloc(fds);
+    fds->main_thread=main_thread;
+    s_poll_add(fds, main_thread ? signal_pipe[0] : terminate_pipe[0], 1, 0);
 }
 
 void s_poll_add(s_poll_set *fds, SOCKET fd, int rd, int wr) {
@@ -222,8 +227,8 @@ NOEXPORT void scan_waiting_queue(void) {
         for(i=0; i<context->fds->nfds; i++) {
             context->fds->ufds[i].revents=ufds[nfds].revents;
 #ifdef DEBUG_UCONTEXT
-            s_log(LOG_DEBUG, "CONTEXT %ld, FD=%d,%s%s ->%s%s%s%s%s",
-                context->id, ufds[nfds].fd,
+            s_log(LOG_DEBUG, "CONTEXT %ld, FD=%ld,%s%s ->%s%s%s%s%s",
+                context->id, (long)ufds[nfds].fd,
                 (ufds[nfds].events & POLLIN) ? " IN" : "",
                 (ufds[nfds].events & POLLOUT) ? " OUT" : "",
                 (ufds[nfds].revents & POLLIN) ? " IN" : "",
@@ -334,6 +339,8 @@ int s_poll_wait(s_poll_set *fds, int sec, int msec) {
     do { /* skip "Interrupted system call" errors */
         retval=poll(fds->ufds, fds->nfds, sec<0 ? -1 : 1000*sec+msec);
     } while(retval<0 && get_last_socket_error()==S_EINTR);
+    if(retval>0)
+        check_terminate(fds);
     return retval;
 }
 
@@ -358,7 +365,7 @@ void s_poll_free(s_poll_set *fds) {
     }
 }
 
-void s_poll_init(s_poll_set *fds) {
+void s_poll_init(s_poll_set *fds, int main_thread) {
 #ifdef USE_WIN32
     fds->allocated=4; /* prealloc 4 file descriptors */
 #endif
@@ -367,6 +374,15 @@ void s_poll_init(s_poll_set *fds) {
     FD_ZERO(fds->iwfds);
     FD_ZERO(fds->ixfds);
     fds->max=0; /* no file descriptors */
+    fds->main_thread=main_thread;
+#ifdef USE_WIN32
+    /* there seems to be a deadlock in the Windows select() function when
+     * waiting for the same terminate_pipe socket in multiple threads */
+    if(main_thread)
+        s_poll_add(fds, signal_pipe[0], 1, 0);
+#else
+    s_poll_add(fds, main_thread ? signal_pipe[0] : terminate_pipe[0], 1, 0);
+#endif
 }
 
 void s_poll_add(s_poll_set *fds, SOCKET fd, int rd, int wr) {
@@ -449,6 +465,8 @@ int s_poll_wait(s_poll_set *fds, int sec, int msec) {
         retval=select((int)fds->max+1,
             fds->orfds, fds->owfds, fds->oxfds, tv_ptr);
     } while(retval<0 && get_last_socket_error()==S_EINTR);
+    if(retval>0)
+        check_terminate(fds);
     return retval;
 }
 
@@ -465,7 +483,7 @@ void s_poll_dump(s_poll_set *fds, int level) {
     SOCKET fd;
     int ir, iw, ix, or, ow, ox;
 
-    for(fd=0; fd<fds->max; fd++) {
+    for(fd=0; fd<fds->max+1; fd++) {
         ir=FD_ISSET(fd, fds->irfds);
         iw=FD_ISSET(fd, fds->iwfds);
         ix=FD_ISSET(fd, fds->ixfds);
@@ -481,16 +499,52 @@ void s_poll_dump(s_poll_set *fds, int level) {
 
 #endif /* USE_POLL */
 
+void s_poll_sleep(int sec, int msec) {
+#ifdef USE_WIN32
+    Sleep(1000*(DWORD)sec+(DWORD)msec);
+#else
+    s_poll_set *fds=s_poll_alloc();
+    s_poll_init(fds, 0);
+    s_poll_wait(fds, sec, msec);
+    s_poll_free(fds);
+#endif
+}
+
+#ifndef USE_UCONTEXT
+NOEXPORT void check_terminate(s_poll_set *fds) {
+    if(!fds->main_thread && s_poll_canread(fds, terminate_pipe[0])) {
+#ifdef USE_PTHREAD
+        pthread_exit(NULL);
+#endif /* USE_PTHREAD */
+#if defined(USE_WIN32) || defined(USE_OS2)
+#if defined(_WIN32_WCE)
+        /* FIXME */
+#else /* !_WIN32_WCE */
+        _endthreadex(0);
+#endif /* _WIN32_WCE */
+#endif /* USE_WIN32 || USE_OS2 */
+#ifdef USE_UCONTEXT
+        /* currently unused */
+        s_poll_wait(NULL, 0, 0); /* wait on poll() */
+#endif /* USE_UCONTEXT */
+#ifdef USE_FORK
+        exit(0);
+#endif /* USE_FORK */
+    }
+}
+#endif
+
 /**************************************** fd management */
 
-int set_socket_options(SOCKET s, int type) {
+int socket_options_set(SERVICE_OPTIONS *service, SOCKET s, int type) {
     SOCK_OPT *ptr;
-    extern SOCK_OPT *sock_opts;
     static char *type_str[3]={"accept", "local", "remote"};
     socklen_t opt_size;
     int retval=0; /* no error found */
 
-    for(ptr=sock_opts; ptr->opt_str; ptr++) {
+    s_log(LOG_DEBUG, "Setting %s socket options (FD=%ld)",
+        type_str[type], (long)s);
+    for(ptr=service->sock_opts; ptr->opt_str; ptr++) {
         if(!ptr->opt_val[type])
             continue; /* default */
         switch(ptr->opt_type) {
@@ -559,8 +613,9 @@ int s_connect(CLI *c, SOCKADDR_UNION *addr, socklen_t addrlen) {
 
     s_log(LOG_DEBUG, "s_connect: s_poll_wait %s: waiting %d seconds",
         dst, c->opt->timeout_connect);
-    s_poll_init(c->fds);
+    s_poll_init(c->fds, 0);
     s_poll_add(c->fds, c->fd, 1, 1);
+    s_poll_dump(c->fds, LOG_DEBUG);
     switch(s_poll_wait(c->fds, c->opt->timeout_connect, 0)) {
     case -1:
         error=get_last_socket_error();
@@ -600,26 +655,26 @@ void s_write(CLI *c, SOCKET fd, const void *buf, size_t len) {
     ssize_t num;
 
     while(len>0) {
-        s_poll_init(c->fds);
+        s_poll_init(c->fds, 0);
         s_poll_add(c->fds, fd, 0, 1); /* write */
         switch(s_poll_wait(c->fds, c->opt->timeout_busy, 0)) {
         case -1:
             sockerror("s_write: s_poll_wait");
-            longjmp(c->err, 1); /* error */
+            throw_exception(c, 1); /* error */
         case 0:
             s_log(LOG_INFO, "s_write: s_poll_wait:"
                 " TIMEOUTbusy exceeded: sending reset");
-            longjmp(c->err, 1); /* timeout */
+            throw_exception(c, 1); /* timeout */
         case 1:
             break; /* OK */
         default:
             s_log(LOG_ERR, "s_write: s_poll_wait: unknown result");
-            longjmp(c->err, 1); /* error */
+            throw_exception(c, 1); /* error */
         }
         num=writesocket(fd, (void *)ptr, len);
         if(num==-1) { /* error */
             sockerror("writesocket (s_write)");
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         }
         ptr+=(size_t)num;
         len-=(size_t)num;
@@ -631,30 +686,30 @@ void s_read(CLI *c, SOCKET fd, void *ptr, size_t len) {
     ssize_t num;
 
     while(len>0) {
-        s_poll_init(c->fds);
+        s_poll_init(c->fds, 0);
         s_poll_add(c->fds, fd, 1, 0); /* read */
         switch(s_poll_wait(c->fds, c->opt->timeout_busy, 0)) {
         case -1:
             sockerror("s_read: s_poll_wait");
-            longjmp(c->err, 1); /* error */
+            throw_exception(c, 1); /* error */
         case 0:
             s_log(LOG_INFO, "s_read: s_poll_wait:"
                 " TIMEOUTbusy exceeded: sending reset");
-            longjmp(c->err, 1); /* timeout */
+            throw_exception(c, 1); /* timeout */
         case 1:
             break; /* OK */
         default:
             s_log(LOG_ERR, "s_read: s_poll_wait: unknown result");
-            longjmp(c->err, 1); /* error */
+            throw_exception(c, 1); /* error */
         }
         num=readsocket(fd, ptr, len);
         switch(num) {
         case -1: /* error */
             sockerror("readsocket (s_read)");
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         case 0: /* EOF */
             s_log(LOG_ERR, "Unexpected socket close (s_read)");
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         }
         ptr=(uint8_t *)ptr+num;
         len-=(size_t)num;
@@ -682,7 +737,7 @@ char *fd_getline(CLI *c, SOCKET fd) {
         if(ptr>65536) { /* >64KB --> DoS protection */
             s_log(LOG_ERR, "fd_getline: Line too long");
             str_free(line);
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         }
         if(allocated<ptr+1) {
             allocated*=2;
@@ -711,7 +766,7 @@ void fd_printf(CLI *c, SOCKET fd, const char *format, ...) {
     va_end(ap);
     if(!line) {
         s_log(LOG_ERR, "fd_printf: str_vprintf failed");
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     fd_putline(c, fd, line);
     str_free(line);
@@ -723,26 +778,26 @@ void s_ssl_write(CLI *c, const void *buf, int len) {
     int num;
 
     while(len>0) {
-        s_poll_init(c->fds);
+        s_poll_init(c->fds, 0);
         s_poll_add(c->fds, c->ssl_wfd->fd, 0, 1); /* write */
         switch(s_poll_wait(c->fds, c->opt->timeout_busy, 0)) {
         case -1:
             sockerror("s_write: s_poll_wait");
-            longjmp(c->err, 1); /* error */
+            throw_exception(c, 1); /* error */
         case 0:
             s_log(LOG_INFO, "s_write: s_poll_wait:"
                 " TIMEOUTbusy exceeded: sending reset");
-            longjmp(c->err, 1); /* timeout */
+            throw_exception(c, 1); /* timeout */
         case 1:
             break; /* OK */
         default:
             s_log(LOG_ERR, "s_write: s_poll_wait: unknown result");
-            longjmp(c->err, 1); /* error */
+            throw_exception(c, 1); /* error */
         }
         num=SSL_write(c->ssl, (void *)ptr, len);
         if(num==-1) { /* error */
             sockerror("SSL_write (s_ssl_write)");
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         }
         ptr+=num;
         len-=num;
@@ -755,31 +810,31 @@ void s_ssl_read(CLI *c, void *ptr, int len) {
 
     while(len>0) {
         if(!SSL_pending(c->ssl)) {
-            s_poll_init(c->fds);
+            s_poll_init(c->fds, 0);
             s_poll_add(c->fds, c->ssl_rfd->fd, 1, 0); /* read */
             switch(s_poll_wait(c->fds, c->opt->timeout_busy, 0)) {
             case -1:
                 sockerror("s_read: s_poll_wait");
-                longjmp(c->err, 1); /* error */
+                throw_exception(c, 1); /* error */
             case 0:
                 s_log(LOG_INFO, "s_read: s_poll_wait:"
                     " TIMEOUTbusy exceeded: sending reset");
-                longjmp(c->err, 1); /* timeout */
+                throw_exception(c, 1); /* timeout */
             case 1:
                 break; /* OK */
             default:
                 s_log(LOG_ERR, "s_read: s_poll_wait: unknown result");
-                longjmp(c->err, 1); /* error */
+                throw_exception(c, 1); /* error */
             }
         }
         num=SSL_read(c->ssl, ptr, len);
         switch(num) {
         case -1: /* error */
             sockerror("SSL_read (s_ssl_read)");
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         case 0: /* EOF */
             s_log(LOG_ERR, "Unexpected socket close (s_ssl_read)");
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         }
         ptr=(uint8_t *)ptr+num;
         len-=num;
@@ -795,7 +850,7 @@ char *ssl_getstring(CLI *c) { /* get null-terminated string */
         if(ptr>65536) { /* >64KB --> DoS protection */
             s_log(LOG_ERR, "ssl_getstring: Line too long");
             str_free(line);
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         }
         if(allocated<ptr+1) {
             allocated*=2;
@@ -818,7 +873,7 @@ char *ssl_getline(CLI *c) { /* get newline-terminated string */
         if(ptr>65536) { /* >64KB --> DoS protection */
             s_log(LOG_ERR, "ssl_getline: Line too long");
             str_free(line);
-            longjmp(c->err, 1);
+            throw_exception(c, 1);
         }
         if(allocated<ptr+1) {
             allocated*=2;
@@ -848,11 +903,26 @@ void ssl_putline(CLI *c, const char *line) { /* put newline-terminated string */
     if(len>INT_MAX) { /* paranoia */
         s_log(LOG_ERR, "ssl_putline: Line too long");
         str_free(tmpline);
-        longjmp(c->err, 1);
+        throw_exception(c, 1);
     }
     s_ssl_write(c, tmpline, (int)len);
     str_free(tmpline);
     s_log(LOG_DEBUG, " -> %s", line);
+}
+
+void ssl_printf(CLI *c, const char *format, ...) {
+    va_list ap;
+    char *line;
+
+    va_start(ap, format);
+    line=str_vprintf(format, ap);
+    va_end(ap);
+    if(!line) {
+        s_log(LOG_ERR, "ssl_printf: str_vprintf failed");
+        throw_exception(c, 1);
+    }
+    ssl_putline(c, line);
+    str_free(line);
 }
 
 /**************************************** network helpers */

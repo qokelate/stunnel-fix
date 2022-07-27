@@ -1,6 +1,6 @@
 /*
  *   stunnel       TLS offloading and load-balancing proxy
- *   Copyright (C) 1998-2017 Michal Trojnara <Michal.Trojnara@stunnel.org>
+ *   Copyright (C) 1998-2021 Michal Trojnara <Michal.Trojnara@stunnel.org>
  *
  *   This program is free software; you can redistribute it and/or modify it
  *   under the terms of the GNU General Public License as published by the
@@ -38,8 +38,8 @@
 #include "common.h"
 #include "prototypes.h"
 
-NOEXPORT void log_raw(const SERVICE_OPTIONS *, const int,
-    const char *, const char *, const char *);
+NOEXPORT void log_queue(SERVICE_OPTIONS *, int, char *, char *, char *);
+NOEXPORT void log_raw(SERVICE_OPTIONS *, int, char *, char *, char *);
 NOEXPORT void safestring(char *);
 
 static DISK_FILE *outfile=NULL;
@@ -55,19 +55,25 @@ static LOG_MODE log_mode=LOG_MODE_BUFFER;
 
 static int syslog_opened=0;
 
-void syslog_open(void) {
-    syslog_close();
-    if(global_options.option.log_syslog)
+NOEXPORT void syslog_open(void) {
+    if(global_options.option.log_syslog) {
+        static char *servname=NULL;
+        char *servname_old;
+
+        /* openlog(3) requires a persistent copy of the "ident" parameter */
+        servname_old=servname;
+        servname=str_dup(service_options.servname);
 #ifdef __ultrix__
-        openlog(service_options.servname, 0);
+        openlog(servname, 0);
 #else
-        openlog(service_options.servname,
-            LOG_CONS|LOG_NDELAY, global_options.log_facility);
+        openlog(servname, LOG_CONS|LOG_NDELAY, global_options.log_facility);
 #endif /* __ultrix__ */
+        str_free(servname_old);
+    }
     syslog_opened=1;
 }
 
-void syslog_close(void) {
+NOEXPORT void syslog_close(void) {
     if(syslog_opened) {
         if(global_options.option.log_syslog)
             closelog();
@@ -77,7 +83,7 @@ void syslog_close(void) {
 
 #endif /* !defined(USE_WIN32) && !defined(__vms) */
 
-int log_open(void) {
+NOEXPORT int outfile_open(void) {
     if(global_options.output_file) { /* 'output' option specified */
         outfile=file_open(global_options.output_file,
             global_options.log_file_mode);
@@ -100,49 +106,41 @@ int log_open(void) {
             return 1;
         }
     }
-    log_flush(LOG_MODE_CONFIGURED);
     return 0;
 }
 
-void log_close(void) {
-    /* prevent changing the mode while logging */
-    CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_LOG_MODE]);
-    log_mode=LOG_MODE_BUFFER;
+NOEXPORT void outfile_close(void) {
     if(outfile) {
         file_close(outfile);
         outfile=NULL;
     }
-    CRYPTO_THREAD_write_unlock(stunnel_locks[LOCK_LOG_MODE]);
 }
 
-void log_flush(LOG_MODE new_mode) {
-    struct LIST *tmp;
+int log_open(int sink) {
+#if !defined(USE_WIN32) && !defined(__vms)
+    if(sink&SINK_SYSLOG)
+        syslog_open();
+#endif
+    if(sink&SINK_OUTFILE && outfile_open())
+        return 1;
+    return 0;
+}
 
+void log_close(int sink) {
+    /* prevent changing the mode while logging */
     CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_LOG_MODE]);
-    /* prevent changing LOG_MODE_CONFIGURED to LOG_MODE_ERROR
-     * once stderr file descriptor is closed */
-    if(log_mode!=LOG_MODE_CONFIGURED)
-        log_mode=new_mode;
-    /* log_raw() will use the new value of log_mode */
-    CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_LOG_BUFFER]);
-    while(head) {
-        log_raw(head->opt, head->level, head->stamp, head->id, head->text);
-        str_free(head->stamp);
-        str_free(head->id);
-        str_free(head->text);
-        tmp=head;
-        head=head->next;
-        str_free(tmp);
-    }
-    head=tail=NULL;
-    CRYPTO_THREAD_write_unlock(stunnel_locks[LOCK_LOG_BUFFER]);
-    CRYPTO_THREAD_write_unlock(stunnel_locks[LOCK_LOG_MODE]);
+#if !defined(USE_WIN32) && !defined(__vms)
+    if(sink&SINK_SYSLOG)
+        syslog_close();
+#endif
+    if(sink&SINK_OUTFILE)
+        outfile_close();
+    CRYPTO_THREAD_unlock(stunnel_locks[LOCK_LOG_MODE]);
 }
 
 void s_log(int level, const char *format, ...) {
     va_list ap;
     char *text, *stamp, *id;
-    struct LIST *tmp;
 #ifdef USE_WIN32
     DWORD libc_error;
 #else
@@ -156,6 +154,9 @@ void s_log(int level, const char *format, ...) {
 #endif
     TLS_DATA *tls_data;
 
+    libc_error=get_last_error();
+    socket_error=get_last_socket_error();
+
     tls_data=tls_get();
     if(!tls_data) {
         tls_data=tls_alloc(NULL, NULL, "log");
@@ -164,68 +165,97 @@ void s_log(int level, const char *format, ...) {
     }
 
     /* performance optimization: skip the trivial case early */
-    if(log_mode==LOG_MODE_CONFIGURED && level>tls_data->opt->log_level)
-        return;
-
-    libc_error=get_last_error();
-    socket_error=get_last_socket_error();
-
-    /* format the id to be logged */
-    time(&gmt);
+    if(log_mode!=LOG_MODE_CONFIGURED || level<=tls_data->opt->log_level) {
+        /* format the id to be logged */
+        time(&gmt);
 #if defined(HAVE_LOCALTIME_R) && defined(_REENTRANT)
-    timeptr=localtime_r(&gmt, &timestruct);
+        timeptr=localtime_r(&gmt, &timestruct);
 #else
-    timeptr=localtime(&gmt);
+        timeptr=localtime(&gmt);
 #endif
-    stamp=str_printf("%04d.%02d.%02d %02d:%02d:%02d",
-        timeptr->tm_year+1900, timeptr->tm_mon+1, timeptr->tm_mday,
-        timeptr->tm_hour, timeptr->tm_min, timeptr->tm_sec);
-    id=str_printf("LOG%d[%s]", level, tls_data->id);
+        stamp=str_printf("%04d.%02d.%02d %02d:%02d:%02d",
+            timeptr->tm_year+1900, timeptr->tm_mon+1, timeptr->tm_mday,
+            timeptr->tm_hour, timeptr->tm_min, timeptr->tm_sec);
+        id=str_printf("LOG%d[%s]", level, tls_data->id);
 
-    /* format the text to be logged */
-    va_start(ap, format);
-    text=str_vprintf(format, ap);
-    va_end(ap);
-    safestring(text);
+        /* format the text to be logged */
+        va_start(ap, format);
+        text=str_vprintf(format, ap);
+        va_end(ap);
+        safestring(text);
 
-    CRYPTO_THREAD_read_lock(stunnel_locks[LOCK_LOG_MODE]);
-    if(log_mode==LOG_MODE_BUFFER) { /* save the text to log it later */
-        CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_LOG_BUFFER]);
-        tmp=str_alloc_detached(sizeof(struct LIST));
-        tmp->next=NULL;
-        tmp->opt=tls_data->opt;
-        tmp->level=level;
-        tmp->stamp=stamp;
-        str_detach(tmp->stamp);
-        tmp->id=id;
-        str_detach(tmp->id);
-        tmp->text=text;
-        str_detach(tmp->text);
-        if(tail)
-            tail->next=tmp;
+        /* either log or queue for logging */
+        CRYPTO_THREAD_read_lock(stunnel_locks[LOCK_LOG_MODE]);
+        if(log_mode==LOG_MODE_BUFFER)
+            log_queue(tls_data->opt, level, stamp, id, text);
         else
-            head=tmp;
-        tail=tmp;
-        CRYPTO_THREAD_write_unlock(stunnel_locks[LOCK_LOG_BUFFER]);
-    } else { /* ready log the text directly */
-        log_raw(tls_data->opt, level, stamp, id, text);
-        str_free(stamp);
-        str_free(id);
-        str_free(text);
+            log_raw(tls_data->opt, level, stamp, id, text);
+        CRYPTO_THREAD_unlock(stunnel_locks[LOCK_LOG_MODE]);
     }
-    CRYPTO_THREAD_read_unlock(stunnel_locks[LOCK_LOG_MODE]);
 
     set_last_error(libc_error);
     set_last_socket_error(socket_error);
 }
 
-NOEXPORT void log_raw(const SERVICE_OPTIONS *opt,
-        const int level, const char *stamp,
-        const char *id, const char *text) {
+NOEXPORT void log_queue(SERVICE_OPTIONS *opt,
+        int level, char *stamp, char *id, char *text) {
+    struct LIST *tmp;
+
+    /* make a new element */
+    tmp=str_alloc_detached(sizeof(struct LIST));
+    tmp->next=NULL;
+    tmp->opt=opt;
+    tmp->level=level;
+    tmp->stamp=stamp;
+    str_detach(tmp->stamp);
+    tmp->id=id;
+    str_detach(tmp->id);
+    tmp->text=text;
+    str_detach(tmp->text);
+
+    /* append the new element to the list */
+    CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_LOG_BUFFER]);
+    if(tail)
+        tail->next=tmp;
+    else
+        head=tmp;
+    tail=tmp;
+    if(stunnel_locks[LOCK_LOG_BUFFER])
+    CRYPTO_THREAD_unlock(stunnel_locks[LOCK_LOG_BUFFER]);
+}
+
+void log_flush(LOG_MODE new_mode) {
+    CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_LOG_MODE]);
+
+    log_mode=new_mode;
+
+    /* emit the buffered logs (unless we just started buffering) */
+    if(new_mode!=LOG_MODE_BUFFER) {
+        /* log_raw() will use the new value of log_mode */
+        CRYPTO_THREAD_write_lock(stunnel_locks[LOCK_LOG_BUFFER]);
+        while(head) {
+            struct LIST *tmp=head;
+            head=head->next;
+            log_raw(tmp->opt, tmp->level, tmp->stamp, tmp->id, tmp->text);
+            str_free(tmp);
+        }
+        head=tail=NULL;
+        CRYPTO_THREAD_unlock(stunnel_locks[LOCK_LOG_BUFFER]);
+    }
+
+    CRYPTO_THREAD_unlock(stunnel_locks[LOCK_LOG_MODE]);
+}
+
+NOEXPORT void log_raw(SERVICE_OPTIONS *opt,
+        int level, char *stamp, char *id, char *text) {
     char *line;
 
-    /* build the line and log it to syslog/file */
-    if(log_mode==LOG_MODE_CONFIGURED) { /* configured */
+    /* NOTE: opt->log_level may have changed since s_log().
+     * It is important to use the new value and not the old one. */
+
+    /* build the line and log it to syslog/file if configured */
+    switch(log_mode) {
+    case LOG_MODE_CONFIGURED:
         line=str_printf("%s %s: %s", stamp, id, text);
         if(level<=opt->log_level) {
 #if !defined(USE_WIN32) && !defined(__vms)
@@ -233,15 +263,25 @@ NOEXPORT void log_raw(const SERVICE_OPTIONS *opt,
                 syslog(level, "%s: %s", id, text);
 #endif /* USE_WIN32, __vms */
             if(outfile)
-                file_putline(outfile, line); /* send log to file */
+                file_putline(outfile, line);
         }
-    } else if(log_mode==LOG_MODE_ERROR) {
+        break;
+    case LOG_MODE_ERROR:
+        /* don't log the id or the time stamp */
         if(level>=0 && level<=7) /* just in case */
             line=str_printf("[%c] %s", "***!:.  "[level], text);
         else
             line=str_printf("[?] %s", text);
-    } else /* LOG_MODE_INFO */
-        line=str_dup(text); /* don't log the time stamp in error mode */
+        break;
+    default: /* LOG_MODE_INFO */
+        /* don't log the level, the id or the time stamp */
+        line=str_dup(text);
+    }
+
+    /* free the memory */
+    str_free(stamp);
+    str_free(id);
+    str_free(text);
 
     /* log the line to the UI (GUI, stderr, etc.) */
     if(log_mode==LOG_MODE_ERROR ||
@@ -250,7 +290,7 @@ NOEXPORT void log_raw(const SERVICE_OPTIONS *opt,
             level<=opt->log_level
 #else
             (level<=opt->log_level &&
-            global_options.option.log_stderr)
+            opt->option.log_stderr)
 #endif
             )
         ui_new_log(line);
@@ -259,7 +299,9 @@ NOEXPORT void log_raw(const SERVICE_OPTIONS *opt,
 }
 
 #ifdef __GNUC__
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
 #pragma GCC diagnostic push
+#endif /* __GNUC__>=4.6 */
 #pragma GCC diagnostic ignored "-Wformat"
 #pragma GCC diagnostic ignored "-Wformat-extra-args"
 #endif /* __GNUC__ */
@@ -275,6 +317,7 @@ char *log_id(CLI *c) {
     case LOG_ID_SEQUENTIAL:
         return str_printf("%llu", c->seq);
     case LOG_ID_UNIQUE:
+        memset(rnd, 0, sizeof rnd);
         if(RAND_bytes(rnd, sizeof rnd)<=0) /* log2(62^22)=130.99 */
             return str_dup("error");
         for(i=0; i<sizeof rnd; ++i) {
@@ -301,14 +344,18 @@ char *log_id(CLI *c) {
     return str_dup("error");
 }
 #ifdef __GNUC__
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
 #pragma GCC diagnostic pop
+#endif /* __GNUC__>=4.6 */
 #endif /* __GNUC__ */
 
 /* critical problem handling */
 /* str.c functions are not safe to use here */
 #ifdef __GNUC__
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-result"
+#endif /* __GNUC__>=4.6 */
 #endif /* __GNUC__ */
 void fatal_debug(char *txt, const char *file, int line) {
     char msg[80];
@@ -359,7 +406,9 @@ void fatal_debug(char *txt, const char *file, int line) {
     abort();
 }
 #ifdef __GNUC__
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
 #pragma GCC diagnostic pop
+#endif /* __GNUC__>=4.6 */
 #endif /* __GNUC__ */
 
 void ioerror(const char *txt) { /* input/output error */
@@ -492,6 +541,19 @@ NOEXPORT void safestring(char *c) {
     for(; *c; ++c)
         if(!(*c&0x80 || isprint((int)*c)))
             *c='.';
+}
+
+/* provide hex string corresponding to the input string
+ * will be NULL terminated */
+void bin2hexstring(const unsigned char *in_data, size_t in_size, char *out_data, size_t out_size) {
+    const char hex[16]="0123456789ABCDEF";
+    size_t i;
+
+    for(i=0; i<in_size && 2*i+2<out_size; ++i) {
+        out_data[2*i]=hex[in_data[i]>>4];
+        out_data[2*i+1]=hex[in_data[i]&0x0f];
+    }
+    out_data[2*i]='\0';
 }
 
 /* end of log.c */

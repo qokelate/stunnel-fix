@@ -7,9 +7,9 @@
 <link rev="made" href="mailto:root@localhost" />
 </head>
 
-<body id="_podtop_">
+<body id="_podtop_" style="background-color: white">
 <table border="0" width="100%" cellspacing="0" cellpadding="3">
-<tr><td class="_podblock_" style="background-color: #cccccc; color: #000" valign="middle">
+<tr><td class="_podblock_" style="background-color: #cccccc" valign="middle">
 <big><strong><span class="_podblock_">&nbsp;stunnel TLS Proxy</span></strong></big>
 </td></tr>
 </table>
@@ -1604,7 +1604,7 @@
 
 <dl>
 
-<dt id="Micha-Trojnara">Micha&#x142; Trojnara</dt>
+<dt id="Micha-Trojnara">Michał Trojnara</dt>
 <dd>
 
 <p>&lt;<i>Michal.Trojnara@stunnel.org</i>&gt;</p>
@@ -1613,7 +1613,7 @@
 </dl>
 
 <table border="0" width="100%" cellspacing="0" cellpadding="3">
-<tr><td class="_podblock_" style="background-color: #cccccc; color: #000" valign="middle">
+<tr><td class="_podblock_" style="background-color: #cccccc" valign="middle">
 <big><strong><span class="_podblock_">&nbsp;stunnel TLS Proxy</span></strong></big>
 </td></tr>
 </table>

@@ -1,6 +1,6 @@
 /*
  *   stunnel       TLS offloading and load-balancing proxy
- *   Copyright (C) 1998-2017 Michal Trojnara <Michal.Trojnara@stunnel.org>
+ *   Copyright (C) 1998-2021 Michal Trojnara <Michal.Trojnara@stunnel.org>
  *
  *   This program is free software; you can redistribute it and/or modify it
  *   under the terms of the GNU General Public License as published by the
@@ -89,8 +89,8 @@ void get_limits(void) { /* set max_fds and max_clients */
         max_fds=16;
 
     if(max_fds) {
-        max_clients=(long)(max_fds>=256 ? max_fds*125/256 : (max_fds-6)/2);
-        s_log(LOG_DEBUG, "Clients allowed=%ld", max_clients);
+        max_clients=(int)(max_fds>=256 ? max_fds*125/256 : (max_fds-6)/2);
+        s_log(LOG_DEBUG, "Clients allowed=%d", max_clients);
     } else {
         max_clients=0;
         s_log(LOG_DEBUG, "No limit detected for the number of clients");
@@ -197,8 +197,8 @@ NOEXPORT SOCKET setup_fd(SOCKET fd, int nonblock, char *msg) {
     }
 #ifndef USE_FORK
     if(max_fds && fd>=max_fds) {
-        s_log(LOG_ERR, "%s: FD=%d out of range (max %d)",
-            msg, (int)fd, (int)max_fds);
+        s_log(LOG_ERR, "%s: FD=%ld out of range (max %d)",
+            msg, (long)fd, (int)max_fds);
         closesocket(fd);
         return INVALID_SOCKET;
     }
@@ -218,8 +218,8 @@ NOEXPORT SOCKET setup_fd(SOCKET fd, int nonblock, char *msg) {
 #endif /* USE_NEW_LINUX_API */
 
 #ifdef DEBUG_FD_ALLOC
-    s_log(LOG_DEBUG, "%s: FD=%d allocated (%sblocking mode)",
-        msg, fd, nonblock?"non-":"");
+    s_log(LOG_DEBUG, "%s: FD=%ld allocated (%sblocking mode)",
+        msg, (long)fd, nonblock?"non-":"");
 #endif /* DEBUG_FD_ALLOC */
 
     return fd;

@@ -1,281 +1,282 @@
+/* src/config.h.  Generated from config.h.in by configure.  */
 /* src/config.h.in.  Generated from configure.ac by autoheader.  */
 
 /* Define to 1 if you have a broken 'poll' implementation. */
-#undef BROKEN_POLL
+/* #undef BROKEN_POLL */
 
 /* Entropy Gathering Daemon socket path */
-#undef EGD_SOCKET
+/* #undef EGD_SOCKET */
 
 /* Define to 1 if you have the `accept4' function. */
-#undef HAVE_ACCEPT4
+#define HAVE_ACCEPT4 1
 
 /* Define to 1 if you have the `chroot' function. */
-#undef HAVE_CHROOT
+#define HAVE_CHROOT 1
 
 /* Define to 1 if you have the `daemon' function. */
-#undef HAVE_DAEMON
+#define HAVE_DAEMON 1
 
 /* Define to 1 if you have '/dev/ptmx' device. */
-#undef HAVE_DEV_PTMX
+#define HAVE_DEV_PTMX 1
 
 /* Define to 1 if you have '/dev/ptc' device. */
-#undef HAVE_DEV_PTS_AND_PTC
+/* #undef HAVE_DEV_PTS_AND_PTC */
 
 /* Define to 1 if you have the <dlfcn.h> header file. */
-#undef HAVE_DLFCN_H
+#define HAVE_DLFCN_H 1
 
 /* Define to 1 if you have the `endhostent' function. */
-#undef HAVE_ENDHOSTENT
+#define HAVE_ENDHOSTENT 1
 
 /* Define to 1 if you have the `FIPS_mode_set' function. */
-#undef HAVE_FIPS_MODE_SET
+#define HAVE_FIPS_MODE_SET 1
 
 /* Define to 1 if you have 'getaddrinfo' function. */
-#undef HAVE_GETADDRINFO
+#define HAVE_GETADDRINFO 1
 
 /* Define to 1 if you have the `getcontext' function. */
-#undef HAVE_GETCONTEXT
+#define HAVE_GETCONTEXT 1
 
 /* Define to 1 if you have the `gethostbyname2' function. */
-#undef HAVE_GETHOSTBYNAME2
+#define HAVE_GETHOSTBYNAME2 1
 
 /* Define to 1 if you have the `getnameinfo' function. */
-#undef HAVE_GETNAMEINFO
+#define HAVE_GETNAMEINFO 1
 
 /* Define to 1 if you have the `getrlimit' function. */
-#undef HAVE_GETRLIMIT
+#define HAVE_GETRLIMIT 1
 
 /* Define to 1 if you have the <grp.h> header file. */
-#undef HAVE_GRP_H
+#define HAVE_GRP_H 1
 
 /* Define to 1 if you have the <inttypes.h> header file. */
-#undef HAVE_INTTYPES_H
+#define HAVE_INTTYPES_H 1
 
 /* Define to 1 if you have the <libutil.h> header file. */
-#undef HAVE_LIBUTIL_H
+/* #undef HAVE_LIBUTIL_H */
 
 /* Define to 1 if you have the <limits.h> header file. */
-#undef HAVE_LIMITS_H
+#define HAVE_LIMITS_H 1
 
 /* Define to 1 if you have the <linux/netfilter_ipv4.h> header file. */
-#undef HAVE_LINUX_NETFILTER_IPV4_H
+#define HAVE_LINUX_NETFILTER_IPV4_H 1
 
 /* Define to 1 if you have the <linux/sched.h> header file. */
-#undef HAVE_LINUX_SCHED_H
+#define HAVE_LINUX_SCHED_H 1
 
 /* Define to 1 if you have the `localtime_r' function. */
-#undef HAVE_LOCALTIME_R
+#define HAVE_LOCALTIME_R 1
 
 /* Define to 1 if you have the <malloc.h> header file. */
-#undef HAVE_MALLOC_H
+#define HAVE_MALLOC_H 1
 
 /* Define to 1 if you have the <memory.h> header file. */
-#undef HAVE_MEMORY_H
+#define HAVE_MEMORY_H 1
 
 /* Define to 1 if you have 'msghdr.msg_control' structure. */
-#undef HAVE_MSGHDR_MSG_CONTROL
+#define HAVE_MSGHDR_MSG_CONTROL 1
 
 /* Define to 1 if you have the `openpty' function. */
-#undef HAVE_OPENPTY
+#define HAVE_OPENPTY 1
 
 /* Define to 1 if you have the `OSSL_PROVIDER_available' function. */
-#undef HAVE_OSSL_PROVIDER_AVAILABLE
+/* #undef HAVE_OSSL_PROVIDER_AVAILABLE */
 
 /* Define to 1 if you have the `pipe2' function. */
-#undef HAVE_PIPE2
+#define HAVE_PIPE2 1
 
 /* Define to 1 if you have the `poll' function. */
-#undef HAVE_POLL
+#define HAVE_POLL 1
 
 /* Define to 1 if you have the <poll.h> header file. */
-#undef HAVE_POLL_H
+#define HAVE_POLL_H 1
 
 /* Define if you have POSIX threads libraries and header files. */
-#undef HAVE_PTHREAD
+/* #undef HAVE_PTHREAD */
 
 /* Define to 1 if you have the <pthread.h> header file. */
-#undef HAVE_PTHREAD_H
+#define HAVE_PTHREAD_H 1
 
 /* Have PTHREAD_PRIO_INHERIT. */
-#undef HAVE_PTHREAD_PRIO_INHERIT
+#define HAVE_PTHREAD_PRIO_INHERIT 1
 
 /* Define to 1 if you have the `pthread_sigmask' function. */
-#undef HAVE_PTHREAD_SIGMASK
+#define HAVE_PTHREAD_SIGMASK 1
 
 /* Define to 1 if you have the <pty.h> header file. */
-#undef HAVE_PTY_H
+#define HAVE_PTY_H 1
 
 /* Define to 1 if you have the `realpath' function. */
-#undef HAVE_REALPATH
+#define HAVE_REALPATH 1
 
 /* Define to 1 if you have the `setgroups' function. */
-#undef HAVE_SETGROUPS
+#define HAVE_SETGROUPS 1
 
 /* Define to 1 if you have the `setsid' function. */
-#undef HAVE_SETSID
+#define HAVE_SETSID 1
 
 /* Define to 1 if you have the `snprintf' function. */
-#undef HAVE_SNPRINTF
+#define HAVE_SNPRINTF 1
 
 /* Define to 1 if you have the <stdint.h> header file. */
-#undef HAVE_STDINT_H
+#define HAVE_STDINT_H 1
 
 /* Define to 1 if you have the <stdlib.h> header file. */
-#undef HAVE_STDLIB_H
+#define HAVE_STDLIB_H 1
 
 /* Define to 1 if you have the <strings.h> header file. */
-#undef HAVE_STRINGS_H
+#define HAVE_STRINGS_H 1
 
 /* Define to 1 if you have the <string.h> header file. */
-#undef HAVE_STRING_H
+#define HAVE_STRING_H 1
 
 /* Define to 1 if you have the <stropts.h> header file. */
-#undef HAVE_STROPTS_H
+/* #undef HAVE_STROPTS_H */
 
 /* Define to 1 if the system has the type `struct addrinfo'. */
-#undef HAVE_STRUCT_ADDRINFO
+#define HAVE_STRUCT_ADDRINFO 1
 
 /* Define to 1 if `msg_control' is a member of `struct msghdr'. */
-#undef HAVE_STRUCT_MSGHDR_MSG_CONTROL
+#define HAVE_STRUCT_MSGHDR_MSG_CONTROL 1
 
 /* Define to 1 if the system has the type `struct sockaddr_un'. */
-#undef HAVE_STRUCT_SOCKADDR_UN
+#define HAVE_STRUCT_SOCKADDR_UN 1
 
 /* Define to 1 if you have the `sysconf' function. */
-#undef HAVE_SYSCONF
+#define HAVE_SYSCONF 1
 
 /* Define to 1 if you have the <systemd/sd-daemon.h> header file. */
-#undef HAVE_SYSTEMD_SD_DAEMON_H
+/* #undef HAVE_SYSTEMD_SD_DAEMON_H */
 
 /* Define to 1 if you have the <sys/filio.h> header file. */
-#undef HAVE_SYS_FILIO_H
+/* #undef HAVE_SYS_FILIO_H */
 
 /* Define to 1 if you have the <sys/ioctl.h> header file. */
-#undef HAVE_SYS_IOCTL_H
+#define HAVE_SYS_IOCTL_H 1
 
 /* Define to 1 if you have the <sys/param.h> header file. */
-#undef HAVE_SYS_PARAM_H
+/* #undef HAVE_SYS_PARAM_H */
 
 /* Define to 1 if you have the <sys/poll.h> header file. */
-#undef HAVE_SYS_POLL_H
+#define HAVE_SYS_POLL_H 1
 
 /* Define to 1 if you have the <sys/resource.h> header file. */
-#undef HAVE_SYS_RESOURCE_H
+#define HAVE_SYS_RESOURCE_H 1
 
 /* Define to 1 if you have the <sys/select.h> header file. */
-#undef HAVE_SYS_SELECT_H
+#define HAVE_SYS_SELECT_H 1
 
 /* Define to 1 if you have the <sys/socket.h> header file. */
-#undef HAVE_SYS_SOCKET_H
+#define HAVE_SYS_SOCKET_H 1
 
 /* Define to 1 if you have the <sys/stat.h> header file. */
-#undef HAVE_SYS_STAT_H
+#define HAVE_SYS_STAT_H 1
 
 /* Define to 1 if you have the <sys/syscall.h> header file. */
-#undef HAVE_SYS_SYSCALL_H
+#define HAVE_SYS_SYSCALL_H 1
 
 /* Define to 1 if you have the <sys/types.h> header file. */
-#undef HAVE_SYS_TYPES_H
+#define HAVE_SYS_TYPES_H 1
 
 /* Define to 1 if you have the <sys/uio.h> header file. */
-#undef HAVE_SYS_UIO_H
+#define HAVE_SYS_UIO_H 1
 
 /* Define to 1 if you have the <sys/un.h> header file. */
-#undef HAVE_SYS_UN_H
+#define HAVE_SYS_UN_H 1
 
 /* Define to 1 if you have the <tcpd.h> header file. */
-#undef HAVE_TCPD_H
+/* #undef HAVE_TCPD_H */
 
 /* Define to 1 if you have the <ucontext.h> header file. */
-#undef HAVE_UCONTEXT_H
+#define HAVE_UCONTEXT_H 1
 
 /* Define to 1 if you have the <unistd.h> header file. */
-#undef HAVE_UNISTD_H
+#define HAVE_UNISTD_H 1
 
 /* Define to 1 if you have the <util.h> header file. */
-#undef HAVE_UTIL_H
+/* #undef HAVE_UTIL_H */
 
 /* Define to 1 if you have the `vsnprintf' function. */
-#undef HAVE_VSNPRINTF
+#define HAVE_VSNPRINTF 1
 
 /* Define to 1 if you have the `wait4' function. */
-#undef HAVE_WAIT4
+#define HAVE_WAIT4 1
 
 /* Define to 1 if you have the `waitpid' function. */
-#undef HAVE_WAITPID
+#define HAVE_WAITPID 1
 
 /* Define to 1 if you have the `_getpty' function. */
-#undef HAVE__GETPTY
+/* #undef HAVE__GETPTY */
 
 /* Define to 1 if you have the `__makecontext_v2' function. */
-#undef HAVE___MAKECONTEXT_V2
+/* #undef HAVE___MAKECONTEXT_V2 */
 
 /* Host description */
-#undef HOST
+#define HOST "x86_64-unknown-linux-gnu"
 
 /* Define to the sub-directory where libtool stores uninstalled libraries. */
-#undef LT_OBJDIR
+#define LT_OBJDIR ".libs/"
 
 /* Name of package */
-#undef PACKAGE
+#define PACKAGE "stunnel"
 
 /* Define to the address where bug reports for this package should be sent. */
-#undef PACKAGE_BUGREPORT
+#define PACKAGE_BUGREPORT ""
 
 /* Define to the full name of this package. */
-#undef PACKAGE_NAME
+#define PACKAGE_NAME "stunnel"
 
 /* Define to the full name and version of this package. */
-#undef PACKAGE_STRING
+#define PACKAGE_STRING "stunnel 5.41"
 
 /* Define to the one symbol short name of this package. */
-#undef PACKAGE_TARNAME
+#define PACKAGE_TARNAME "stunnel"
 
 /* Define to the home page for this package. */
-#undef PACKAGE_URL
+#define PACKAGE_URL ""
 
 /* Define to the version of this package. */
-#undef PACKAGE_VERSION
+#define PACKAGE_VERSION "5.41"
 
 /* Define to necessary symbol if this constant uses a non-standard name on
    your system. */
-#undef PTHREAD_CREATE_JOINABLE
+/* #undef PTHREAD_CREATE_JOINABLE */
 
 /* Random file path */
-#undef RANDOM_FILE
+#define RANDOM_FILE "/dev/urandom"
 
 /* TLS directory */
-#undef SSLDIR
+#define SSLDIR "libopenssl"
 
 /* Define to 1 if you have the ANSI C header files. */
-#undef STDC_HEADERS
+#define STDC_HEADERS 1
 
 /* Define to 1 to enable OpenSSL FIPS support */
-#undef USE_FIPS
+#define USE_FIPS 1
 
 /* Define to 1 to select FORK mode */
-#undef USE_FORK
+/* #undef USE_FORK */
 
 /* Define to 1 to enable IPv6 support */
-#undef USE_IPv6
+#define USE_IPv6 1
 
 /* Define to 1 to enable TCP wrappers support */
-#undef USE_LIBWRAP
+/* #undef USE_LIBWRAP */
 
 /* Define to 1 to select PTHREAD mode */
-#undef USE_PTHREAD
+#define USE_PTHREAD 1
 
 /* Define to 1 to enable systemd socket activation */
-#undef USE_SYSTEMD
+/* #undef USE_SYSTEMD */
 
 /* Define to 1 to select UCONTEXT mode */
-#undef USE_UCONTEXT
+/* #undef USE_UCONTEXT */
 
 /* Version number of package */
-#undef VERSION
+#define VERSION "5.41"
 
 /* Use Darwin source */
-#undef _DARWIN_C_SOURCE
+/* #undef _DARWIN_C_SOURCE */
 
 /* Enable large inode numbers on Mac OS X 10.5.  */
 #ifndef _DARWIN_USE_64_BIT_INODE
@@ -283,75 +284,75 @@
 #endif
 
 /* Number of bits in a file offset, on hosts where this is settable. */
-#undef _FILE_OFFSET_BITS
+/* #undef _FILE_OFFSET_BITS */
 
 /* Use GNU source */
-#undef _GNU_SOURCE
+#define _GNU_SOURCE 1
 
 /* Define for large files, on AIX-style hosts. */
-#undef _LARGE_FILES
+/* #undef _LARGE_FILES */
 
 /* Define for Solaris 2.5.1 so the uint32_t typedef from <sys/synch.h>,
    <pthread.h>, or <semaphore.h> is not used. If the typedef were allowed, the
    #define below would cause a syntax error. */
-#undef _UINT32_T
+/* #undef _UINT32_T */
 
 /* Define for Solaris 2.5.1 so the uint64_t typedef from <sys/synch.h>,
    <pthread.h>, or <semaphore.h> is not used. If the typedef were allowed, the
    #define below would cause a syntax error. */
-#undef _UINT64_T
+/* #undef _UINT64_T */
 
 /* Define for Solaris 2.5.1 so the uint8_t typedef from <sys/synch.h>,
    <pthread.h>, or <semaphore.h> is not used. If the typedef were allowed, the
    #define below would cause a syntax error. */
-#undef _UINT8_T
+/* #undef _UINT8_T */
 
 /* Use X/Open 5 with POSIX 1995 */
-#undef _XOPEN_SOURCE
+/* #undef _XOPEN_SOURCE */
 
 /* Define to `int' if <sys/types.h> doesn't define. */
-#undef gid_t
+/* #undef gid_t */
 
 /* Define to the type of a signed integer type of width exactly 16 bits if
    such a type exists and the standard includes do not define it. */
-#undef int16_t
+/* #undef int16_t */
 
 /* Define to the type of a signed integer type of width exactly 32 bits if
    such a type exists and the standard includes do not define it. */
-#undef int32_t
+/* #undef int32_t */
 
 /* Define to the type of a signed integer type of width exactly 64 bits if
    such a type exists and the standard includes do not define it. */
-#undef int64_t
+/* #undef int64_t */
 
 /* Define to the type of a signed integer type of width exactly 8 bits if such
    a type exists and the standard includes do not define it. */
-#undef int8_t
+/* #undef int8_t */
 
 /* Define to `unsigned int' if <sys/types.h> does not define. */
-#undef size_t
+/* #undef size_t */
 
 /* Type of socklen_t */
-#undef socklen_t
+/* #undef socklen_t */
 
 /* Define to `int' if <sys/types.h> does not define. */
-#undef ssize_t
+/* #undef ssize_t */
 
 /* Define to `int' if <sys/types.h> doesn't define. */
-#undef uid_t
+/* #undef uid_t */
 
 /* Define to the type of an unsigned integer type of width exactly 16 bits if
    such a type exists and the standard includes do not define it. */
-#undef uint16_t
+/* #undef uint16_t */
 
 /* Define to the type of an unsigned integer type of width exactly 32 bits if
    such a type exists and the standard includes do not define it. */
-#undef uint32_t
+/* #undef uint32_t */
 
 /* Define to the type of an unsigned integer type of width exactly 64 bits if
    such a type exists and the standard includes do not define it. */
-#undef uint64_t
+/* #undef uint64_t */
 
 /* Define to the type of an unsigned integer type of width exactly 8 bits if
    such a type exists and the standard includes do not define it. */
-#undef uint8_t
+/* #undef uint8_t */

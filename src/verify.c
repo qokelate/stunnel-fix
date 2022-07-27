@@ -1,6 +1,6 @@
 /*
  *   stunnel       TLS offloading and load-balancing proxy
- *   Copyright (C) 1998-2017 Michal Trojnara <Michal.Trojnara@stunnel.org>
+ *   Copyright (C) 1998-2021 Michal Trojnara <Michal.Trojnara@stunnel.org>
  *
  *   This program is free software; you can redistribute it and/or modify it
  *   under the terms of the GNU General Public License as published by the
@@ -214,18 +214,23 @@ NOEXPORT int verify_callback(int preverify_ok, X509_STORE_CTX *callback_ctx) {
         s_log(LOG_INFO, "Certificate verification disabled");
         return 1; /* accept */
     }
-    if(verify_checks(c, preverify_ok, callback_ctx)) {
-        if(!SSL_SESSION_set_ex_data(SSL_get_session(ssl),
-                index_session_authenticated, (void *)(-1))) {
+    if(verify_checks(c, preverify_ok, callback_ctx))
+        return 1; /* accept */
+    if(c->opt->option.connect_before_ssl)
+        return 0; /* reject */
+    if(c->opt->redirect_addr.names) {
+        SSL_SESSION *sess=SSL_get1_session(c->ssl);
+        if(!sess)
+            return 0; /* reject */
+        if(!SSL_SESSION_set_ex_data(sess,
+                index_session_authenticated, NULL)) {
             sslerror("SSL_SESSION_set_ex_data");
+            SSL_SESSION_free(sess);
             return 0; /* reject */
         }
+        SSL_SESSION_free(sess);
         return 1; /* accept */
     }
-    if(c->opt->option.client || c->opt->protocol)
-        return 0; /* reject */
-    if(c->opt->redirect_addr.names)
-        return 1; /* accept */
     return 0; /* reject */
 }
 
@@ -273,7 +278,8 @@ NOEXPORT int cert_check(CLI *c, X509_STORE_CTX *callback_ctx,
     } else { /* remote site sent an invalid certificate */
         if(c->opt->option.verify_chain || (depth==0 &&
                 err!=X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY &&
-                err!=X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE)) {
+                err!=X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE &&
+                err!=X509_V_ERR_CERT_UNTRUSTED)) {
             s_log(LOG_WARNING, "CERT: Pre-verification error: %s",
                 X509_verify_cert_error_string(err));
             /* retain the STORE_CTX error produced by pre-verification */
@@ -301,42 +307,35 @@ NOEXPORT int cert_check_subject(CLI *c, X509_STORE_CTX *callback_ctx) {
     NAME_LIST *ptr;
     char *peername=NULL;
 
-    if(c->opt->check_host) {
-        for(ptr=c->opt->check_host; ptr; ptr=ptr->next)
-            if(X509_check_host(cert, ptr->name, 0, 0, &peername)>0)
-                break;
-        if(!ptr) {
-            s_log(LOG_WARNING, "CERT: No matching host name found");
-            return 0; /* reject */
-        }
-        s_log(LOG_INFO, "CERT: Host name \"%s\" matched with \"%s\"",
-            ptr->name, peername);
-        OPENSSL_free(peername);
+    if(!c->opt->check_host && !c->opt->check_email && !c->opt->check_ip) {
+        s_log(LOG_INFO, "CERT: No subject checks configured");
+        return 1; /* accept */
     }
 
-    if(c->opt->check_email) {
-        for(ptr=c->opt->check_email; ptr; ptr=ptr->next)
-            if(X509_check_email(cert, ptr->name, 0, 0)>0)
-                break;
-        if(!ptr) {
-            s_log(LOG_WARNING, "CERT: No matching email address found");
-            return 0; /* reject */
+    for(ptr=c->opt->check_host; ptr; ptr=ptr->next)
+        if(X509_check_host(cert, ptr->name, 0, 0, &peername)>0) {
+            s_log(LOG_INFO, "CERT: Host name \"%s\" matched with \"%s\"",
+                ptr->name, peername);
+            OPENSSL_free(peername);
+            return 1; /* accept */
         }
-        s_log(LOG_INFO, "CERT: Email address \"%s\" matched", ptr->name);
-    }
 
-    if(c->opt->check_ip) {
-        for(ptr=c->opt->check_ip; ptr; ptr=ptr->next)
-            if(X509_check_ip_asc(cert, ptr->name, 0)>0)
-                break;
-        if(!ptr) {
-            s_log(LOG_WARNING, "CERT: No matching IP address found");
-            return 0; /* reject */
+    for(ptr=c->opt->check_email; ptr; ptr=ptr->next)
+        if(X509_check_email(cert, ptr->name, 0, 0)>0) {
+            s_log(LOG_INFO, "CERT: Email address \"%s\" matched",
+                ptr->name);
+            return 1; /* accept */
         }
-        s_log(LOG_INFO, "CERT: IP address \"%s\" matched", ptr->name);
-    }
 
-    return 1; /* accept */
+    for(ptr=c->opt->check_ip; ptr; ptr=ptr->next)
+        if(X509_check_ip_asc(cert, ptr->name, 0)>0) {
+            s_log(LOG_INFO, "CERT: IP address \"%s\" matched",
+                ptr->name);
+            return 1; /* accept */
+        }
+
+    s_log(LOG_WARNING, "CERT: Subject checks failed");
+    return 0; /* reject */
 }
 #endif /* OPENSSL_VERSION_NUMBER>=0x10002000L */
 
@@ -657,7 +656,7 @@ NOEXPORT OCSP_RESPONSE *ocsp_get_response(CLI *c,
 
     /* OCSP protocol communication loop */
     while(OCSP_sendreq_nbio(&resp, req_ctx)==-1) {
-        s_poll_init(c->fds);
+        s_poll_init(c->fds, 0);
         s_poll_add(c->fds, c->fd, BIO_should_read(bio), BIO_should_write(bio));
         switch(s_poll_wait(c->fds, c->opt->timeout_busy, 0)) {
         case -1:

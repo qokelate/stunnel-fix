@@ -1,6 +1,6 @@
 /*
  *   stunnel       TLS offloading and load-balancing proxy
- *   Copyright (C) 1998-2017 Michal Trojnara <Michal.Trojnara@stunnel.org>
+ *   Copyright (C) 1998-2021 Michal Trojnara <Michal.Trojnara@stunnel.org>
  *
  *   This program is free software; you can redistribute it and/or modify it
  *   under the terms of the GNU General Public License as published by the
@@ -42,6 +42,8 @@
 
 /**************************************** common constants */
 
+#define DEFAULT_SECURITY_LEVEL 2
+
 #define LIBWRAP_CLIENTS 5
 
 /* CPU stack size */
@@ -52,8 +54,10 @@
 #define BUFFSIZE 18432
 
 /* how many bytes of random input to read from files for PRNG */
-/* OpenSSL likes at least 128 bits, so 64 bytes seems plenty. */
-#define RANDOM_BYTES 64
+/* security margin is huge to compensate for flawed entropy */
+#define RANDOM_BYTES 1024
+
+/**************************************** debugging */
 
 /* for FormatGuard */
 /* #define __NO_FORMATGUARD_ */
@@ -66,6 +70,12 @@
 #else
 #define NOEXPORT static
 #endif
+
+#ifdef __GNUC__
+#define NORETURN __attribute__((noreturn))
+#else
+#define NORETURN
+#endif /* __GNUC__ */
 
 /**************************************** platform */
 
@@ -94,7 +104,6 @@ typedef __int64             ssize_t;
 typedef int                 ssize_t;
 #endif /* _WIN64 */
 #endif /* !__MINGW32__ */
-#define PATH_MAX MAX_PATH
 #define USE_IPv6
 #define _CRT_SECURE_NO_DEPRECATE
 #define _CRT_NONSTDC_NO_DEPRECATE
@@ -217,7 +226,6 @@ typedef int                 ssize_t;
 #define vsnprintf                   _vsnprintf
 #define strcasecmp                  _stricmp
 #define strncasecmp                 _strnicmp
-#define sleep(c)                    Sleep(1000*(c))
 
 #define get_last_socket_error()     WSAGetLastError()
 #define set_last_socket_error(e)    WSASetLastError(e)
@@ -309,6 +317,9 @@ typedef int SOCKET;
 #include <sys/select.h>     /* for aix */
 #endif
 #include <dirent.h>
+#ifdef HAVE_SYS_PARAM_H
+#include <sys/param.h>      /* MAXPATHLEN */
+#endif
 
 #if defined(HAVE_POLL) && !defined(BROKEN_POLL)
 #ifdef HAVE_POLL_H
@@ -353,16 +364,6 @@ typedef int SOCKET;
 #endif
 #ifndef INADDR_LOOPBACK
 #define INADDR_LOOPBACK  (u32)0x7F000001
-#endif
-
-#if defined(HAVE_WAITPID)
-/* for SYSV systems */
-#define wait_for_pid(a, b, c) waitpid((a), (b), (c))
-#define HAVE_WAIT_FOR_PID 1
-#elif defined(HAVE_WAIT4)
-/* for BSD systems */
-#define wait_for_pid(a, b, c) wait4((a), (b), (c), NULL)
-#define HAVE_WAIT_FOR_PID 1
 #endif
 
 /* SunOS 4 */
@@ -454,12 +455,18 @@ extern char *sys_errlist[];
 #endif /* !defined(OPENSSL_NO_SSL2) */
 #else /* OpenSSL older than 1.1.0 */
 #define X509_STORE_CTX_get0_chain(x) X509_STORE_CTX_get_chain(x)
+#define OPENSSL_hexstr2buf string_to_hex
 #endif /* OpenSSL 1.1.0 or newer */
 
-#if defined(USE_WIN32) && defined(OPENSSL_FIPS)
+#if OPENSSL_VERSION_NUMBER<0x10101000L
+#define OPENSSL_NO_TLS1_3
+#endif /* OpenSSL older than 1.1.1 */
+
+#ifdef USE_WIN32
 #define USE_FIPS
 #endif
 
+#include <openssl/conf.h>
 #include <openssl/lhash.h>
 #include <openssl/ssl.h>
 #include <openssl/ui.h>
@@ -488,6 +495,9 @@ int DH_set0_pqg(DH *dh, BIGNUM *p, BIGNUM *q, BIGNUM *g);
 /* not defined in public headers before OpenSSL 0.9.8 */
 STACK_OF(SSL_COMP) *SSL_COMP_get_compression_methods(void);
 #endif /* !defined(OPENSSL_NO_COMP) */
+#if OPENSSL_VERSION_NUMBER>=0x30000000L
+#include <openssl/provider.h>
+#endif /* OPENSSL_VERSION_NUMBER>=0x30000000L */
 
 #ifndef OPENSSL_VERSION
 #define OPENSSL_VERSION SSLEAY_VERSION
